@@ -199,6 +199,9 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         seq_kd (bool): Whether to use sequence-level knowledge distillation for GKD. Defaults to False.
         offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD
             training. Defaults to False.
+        teacher_domain_map (Optional[str]): JSON string mapping data channel names to teacher model paths for
+            multi-teacher GKD. Each training sample is routed to its assigned teacher based on the 'channel' field.
+            Mutually exclusive with --teacher_model. Defaults to None.
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
             Defaults to None.
     """
@@ -235,6 +238,16 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     lmbda: float = 0.5
     seq_kd: bool = False
     offload_teacher_model: bool = False
+    # Multi-teacher GKD
+    teacher_domain_map: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'JSON string mapping data channel names to teacher model paths for multi-teacher GKD. '
+            'e.g. \'{"math": "/path/to/math_teacher", "code": "/path/to/code_teacher"}\'. '
+            'Mutually exclusive with --teacher_model (single-teacher). '
+            'Each data sample must have a "channel" field matching one of the keys.'
+        })
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 
@@ -554,3 +567,43 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         if self.async_generate:
             raise NotImplementedError('Currently, async_generate is not supported for GKD.')
+
+        # Multi-teacher GKD validation
+        self._teacher_paths = None
+        self._channel_to_teacher_idx = None
+
+        if self.teacher_domain_map is not None:
+            import json
+            if isinstance(self.teacher_domain_map, str):
+                self.teacher_domain_map = json.loads(self.teacher_domain_map)
+            if not isinstance(self.teacher_domain_map, dict) or not self.teacher_domain_map:
+                raise ValueError(
+                    f'teacher_domain_map must be a non-empty JSON dict, got {type(self.teacher_domain_map)}')
+            for domain, model_path in self.teacher_domain_map.items():
+                if not isinstance(domain, str) or not isinstance(model_path, str):
+                    raise ValueError(f'teacher_domain_map entries must be str→str, got {domain!r}: {model_path!r}')
+
+        if self.teacher_domain_map and self.teacher_model:
+            raise ValueError(
+                '--teacher_domain_map and --teacher_model are mutually exclusive. '
+                'Use --teacher_domain_map for multi-teacher, --teacher_model for single-teacher.')
+
+        if self.teacher_domain_map is None and self.teacher_model is None:
+            raise ValueError('GKD requires either --teacher_model (single) or --teacher_domain_map (multi).')
+
+        # Deduplicate: build unique teacher paths and channel→index mapping
+        if self.teacher_domain_map is not None:
+            unique_paths = []
+            path_to_idx = {}
+            for domain, model_path in self.teacher_domain_map.items():
+                if model_path not in path_to_idx:
+                    path_to_idx[model_path] = len(unique_paths)
+                    unique_paths.append(model_path)
+            self._teacher_paths = unique_paths
+            self._channel_to_teacher_idx = {
+                domain: path_to_idx[path]
+                for domain, path in self.teacher_domain_map.items()
+            }
+            logger.info(f'Multi-teacher GKD: {len(unique_paths)} unique teacher(s) '
+                        f'for {len(self.teacher_domain_map)} domain(s)')
+            logger.info(f'  Channel->teacher mapping: {self._channel_to_teacher_idx}')

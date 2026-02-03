@@ -109,6 +109,38 @@ class SwiftRLHF(SwiftSft):
         HfConfigFactory.set_model_config_attr(model, 'use_cache', False)
         return model, processor
 
+    def _load_teacher_models(self):
+        """Load teacher model(s) for GKD. Supports single-teacher and multi-teacher modes.
+
+        Single-teacher (--teacher_model): loads one teacher, wraps in list.
+        Multi-teacher (--teacher_domain_map): loads each unique teacher path once.
+        """
+        args = self.args
+
+        if args._teacher_paths is not None:
+            # Multi-teacher mode
+            teacher_models = []
+            original_teacher_model = args.teacher_model
+            for teacher_path in args._teacher_paths:
+                args.teacher_model = teacher_path
+                result = self._prepare_single_model('teacher', 'teacher', None, None)
+                if result is not None:
+                    model, _ = result
+                    teacher_models.append(model)
+            args.teacher_model = original_teacher_model
+            self.teacher_model = teacher_models
+            logger.info(f'Multi-teacher GKD: loaded {len(teacher_models)} unique teacher(s) '
+                        f'for {len(args.teacher_domain_map)} domain(s)')
+        else:
+            # Single-teacher mode (backward compat)
+            result = self._prepare_single_model(
+                'teacher', 'teacher', args.teacher_model_type, args.teacher_model_revision)
+            if result is not None:
+                model, _ = result
+                self.teacher_model = [model]
+            else:
+                self.teacher_model = None
+
     def _prepare_model_tokenizer(self):
         # prepare ref/reward/value model
         args = self.args
@@ -121,6 +153,11 @@ class SwiftRLHF(SwiftSft):
                 continue
             if key == 'teacher' and args.rlhf_type != 'gkd':
                 continue
+
+            if key == 'teacher':
+                self._load_teacher_models()
+                continue
+
             model_key = 'reward' if key == 'value' else key
             model_type = getattr(args, f'{model_key}_model_type')
             model_revision = getattr(args, f'{model_key}_model_revision')
@@ -219,10 +256,16 @@ class SwiftRLHF(SwiftSft):
     def _get_trainer_kwargs(self):
         trainer_kwargs = {}
         for key in ['ref', 'reward', 'value', 'teacher']:
-            key = f'{key}_model'
-            model = getattr(self, key, None)
-            if model or self.args.rlhf_type == 'ppo' and key != 'teacher_model':
-                trainer_kwargs[key] = model
+            key_name = f'{key}_model'
+            model = getattr(self, key_name, None)
+            if key == 'teacher' and model is not None:
+                # teacher_model is always a list (single or multi)
+                trainer_kwargs['teacher_model'] = model if isinstance(model, list) else [model]
+                trainer_kwargs['channel_to_teacher_idx'] = getattr(
+                    self.args, '_channel_to_teacher_idx', None)
+                continue
+            if model or self.args.rlhf_type == 'ppo' and key_name != 'teacher_model':
+                trainer_kwargs[key_name] = model
         if hasattr(self, 'reward_template'):
             trainer_kwargs['reward_template'] = self.reward_template
         if self.args.rlhf_type in ['grpo', 'gkd']:

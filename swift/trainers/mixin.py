@@ -916,6 +916,11 @@ class SwiftMixin:
                 if isinstance(model, nn.Module):
                     models.append(model)
 
+            # Multi-teacher GKD: register all teacher models (not just the alias)
+            teacher_models = getattr(self, 'teacher_models', None)
+            if teacher_models is not None and isinstance(teacher_models, list):
+                models.extend([m for m in teacher_models if isinstance(m, nn.Module)])
+
             reward_model = getattr(self, 'reward_model', None)
             if reward_model is not None:
                 if isinstance(reward_model, list):

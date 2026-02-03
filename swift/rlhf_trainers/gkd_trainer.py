@@ -51,8 +51,9 @@ class DataSource(str, Enum):
 class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
     def __init__(self, model: Optional[Union[PreTrainedModel, nn.Module, str]] = None, *_args, **kwargs):
-        teacher_model = kwargs.pop('teacher_model')
+        teacher_models_input = kwargs.pop('teacher_model')  # Always a list from pipeline
         teacher_deepspeed_config = kwargs.pop('teacher_deepspeed_config', None)
+        self.channel_to_teacher_idx = kwargs.pop('channel_to_teacher_idx', None)
         self.vllm_client = kwargs.pop('vllm_client', None)
         super().__init__(model, None, *_args, **kwargs)
         args = kwargs['args']
@@ -70,25 +71,48 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         self._prepare_liger_loss()
 
         self.teacher_ds3_gather_for_generation = args.ds3_gather_for_generation
-        self.is_teacher_ds3 = None
-        # Initialize teacher model
-        if self.is_deepspeed_enabled:
-            if teacher_deepspeed_config is not None:
-                self.is_teacher_ds3 = teacher_deepspeed_config.get('zero_optimization', {}).get('stage') == 3
-                if not self.is_teacher_ds3:
-                    self.teacher_ds3_gather_for_generation = False
-                self.teacher_model = prepare_deepspeed(
-                    teacher_model, self.accelerator, deepspeed_config=teacher_deepspeed_config, training_args=args)
+
+        # Initialize teacher model(s) — supports both single and multi-teacher
+        if not isinstance(teacher_models_input, list):
+            teacher_models_input = [teacher_models_input]
+
+        self.teacher_models = []
+        self.is_teacher_ds3_list = []
+
+        for tm in teacher_models_input:
+            if self.is_deepspeed_enabled:
+                if teacher_deepspeed_config is not None:
+                    is_ds3 = teacher_deepspeed_config.get('zero_optimization', {}).get('stage') == 3
+                    self.is_teacher_ds3_list.append(is_ds3)
+                    if not is_ds3:
+                        self.teacher_ds3_gather_for_generation = False
+                    prepared = prepare_deepspeed(
+                        tm, self.accelerator, deepspeed_config=teacher_deepspeed_config, training_args=args)
+                else:
+                    self.is_teacher_ds3_list.append(None)
+                    prepared = prepare_deepspeed(tm, self.accelerator)
+            elif self.is_fsdp_enabled:
+                from .utils import prepare_fsdp
+                self.is_teacher_ds3_list.append(False)
+                prepared = prepare_fsdp(tm, self.accelerator)
             else:
-                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
-        elif self.is_fsdp_enabled:
-            from .utils import prepare_fsdp
-            self.teacher_model = prepare_fsdp(teacher_model, self.accelerator)
-        else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
-        self.teacher_model.eval()
+                self.is_teacher_ds3_list.append(False)
+                prepared = self.accelerator.prepare_model(tm, evaluation_mode=True)
+            prepared.eval()
+            self.teacher_models.append(prepared)
+
+        # Backward compat aliases for single-teacher code paths
+        self.teacher_model = self.teacher_models[0]
+        self.is_teacher_ds3 = self.is_teacher_ds3_list[0] if self.is_teacher_ds3_list else None
+
+        if len(self.teacher_models) > 1:
+            logger.info(f'Multi-teacher GKD: initialized {len(self.teacher_models)} teacher(s)')
+            if self.channel_to_teacher_idx:
+                logger.info(f'  Channel->teacher routing: {self.channel_to_teacher_idx}')
+
         if self.args.offload_teacher_model:
-            self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
+            for tm in self.teacher_models:
+                self.offload_model(self.accelerator.unwrap_model(tm))
 
         # Initialize rollout infrastructure for vLLM support
         self.prepare_rollout()
@@ -108,6 +132,102 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
     def _get_data_collator(self, args, template):
         return identity_data_collator
+
+    # Multi-teacher routing helpers
+
+    def _get_teacher_indices(self, channels):
+        """Map channel values to teacher indices for per-sample routing.
+
+        Args:
+            channels: list of channel strings (one per sample in batch), or None
+
+        Returns:
+            list of int teacher indices, or None if single-teacher or no routing needed
+        """
+        if channels is None or self.channel_to_teacher_idx is None or len(self.teacher_models) <= 1:
+            return None
+
+        indices = []
+        for ch in channels:
+            if ch is not None and ch in self.channel_to_teacher_idx:
+                indices.append(self.channel_to_teacher_idx[ch])
+            else:
+                indices.append(0)  # Default to first teacher
+        return indices
+
+    def _multi_teacher_forward(self, model_inputs, teacher_indices):
+        """Run per-sample teacher routing: groups by teacher, runs subset forwards, scatters back.
+
+        Args:
+            model_inputs: dict with tensors of shape [batch, seq, ...]
+            teacher_indices: list[int] of length batch_size
+
+        Returns:
+            teacher_logits: tensor [batch, seq, vocab] with per-sample teacher logits
+        """
+        batch_size = model_inputs['input_ids'].shape[0]
+        device = model_inputs['input_ids'].device
+        teacher_logits = None
+        max_vocab_size = 0
+
+        # Group samples by teacher
+        teacher_to_samples = defaultdict(list)
+        for sample_idx, teacher_idx in enumerate(teacher_indices):
+            teacher_to_samples[teacher_idx].append(sample_idx)
+
+        for teacher_idx, sample_idxs in teacher_to_samples.items():
+            sample_idxs_tensor = torch.tensor(sample_idxs, device=device)
+
+            # Extract subset of batch for this teacher
+            subset_inputs = {}
+            for k, v in model_inputs.items():
+                if isinstance(v, torch.Tensor) and v.shape[0] == batch_size:
+                    subset_inputs[k] = v[sample_idxs_tensor]
+                else:
+                    subset_inputs[k] = v
+
+            teacher_model = self.teacher_models[teacher_idx]
+            is_ds3 = self.is_teacher_ds3_list[teacher_idx] if teacher_idx < len(self.is_teacher_ds3_list) else None
+            load_ctx = self._load_single_teacher_context(teacher_idx) if self.args.offload_teacher_model else nullcontext()
+            with torch.no_grad(), load_ctx, disable_gradient_checkpointing(
+                    teacher_model, self.args.gradient_checkpointing_kwargs):
+                subset_outputs = teacher_model(**subset_inputs)
+
+            subset_logits = subset_outputs.logits
+            vocab_size = subset_logits.shape[-1]
+
+            # Initialize or expand output tensor
+            if teacher_logits is None:
+                seq_len = subset_logits.shape[1]
+                max_vocab_size = vocab_size
+                teacher_logits = torch.zeros(
+                    batch_size, seq_len, vocab_size,
+                    dtype=subset_logits.dtype, device=device)
+            elif vocab_size > max_vocab_size:
+                # Expand to accommodate larger vocab
+                teacher_logits = F.pad(teacher_logits, (0, vocab_size - max_vocab_size), 'constant', 0)
+                max_vocab_size = vocab_size
+            elif vocab_size < max_vocab_size:
+                # Pad this teacher's logits to match
+                subset_logits = F.pad(subset_logits, (0, max_vocab_size - vocab_size), 'constant', 0)
+
+            # Scatter subset logits back into full batch
+            teacher_logits[sample_idxs_tensor] = subset_logits
+
+        return teacher_logits
+
+    @contextmanager
+    def _load_single_teacher_context(self, teacher_idx):
+        """Load/offload a specific teacher by index."""
+        if not self.args.offload_teacher_model:
+            yield
+            return
+        teacher = self.accelerator.unwrap_model(self.teacher_models[teacher_idx])
+        self.load_model(teacher)
+        try:
+            yield
+        finally:
+            self.offload_model(teacher)
 
     # Code borrowed from huggingface/trl
     def generate_on_policy_outputs(self, model, inputs, generation_config, pad_token_id=None):
@@ -153,6 +273,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Get data source: DataSource.STUDENT, DataSource.TEACHER, or DataSource.DATASET
         data_source = inputs.pop('_data_source', DataSource.DATASET)
+        # Pop channel for multi-teacher routing (also prevents leaking to model forward)
+        channels = inputs.pop('channel', None)
         model_inputs = {k: v for k, v in inputs.items() if k not in {'prompt', 'labels'}}
         # If generate is used, then use_logits_to_keep must be set to False.
         use_logits_to_keep = self.get_use_logits_to_keep(True)
@@ -160,8 +282,17 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             self.prepare_logits_to_keep(inputs)
             model_inputs['logits_to_keep'] = inputs['logits_to_keep']
 
-        if self.use_liger_gkd_loss:
-            # Liger fused JSD loss for memory efficiency
+        # Determine per-sample teacher routing
+        teacher_indices = self._get_teacher_indices(channels)
+        use_multi_teacher = teacher_indices is not None and len(set(teacher_indices)) > 1
+
+        if self.use_liger_gkd_loss and not use_multi_teacher:
+            # Liger fused JSD loss for memory efficiency (single teacher only)
+            teacher_idx = 0 if teacher_indices is None else teacher_indices[0]
+            teacher_model_selected = self.teacher_models[teacher_idx]
+            is_ds3_selected = self.is_teacher_ds3_list[teacher_idx] if teacher_idx < len(
+                self.is_teacher_ds3_list) else None
+
             # Get base models (exclude lm_head to save memory)
             unwrapped_student = self.accelerator.unwrap_model(model)
             if is_peft_model(unwrapped_student):
@@ -169,16 +300,17 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             base_student = getattr(unwrapped_student, getattr(unwrapped_student, 'base_model_prefix', 'model'),
                                    unwrapped_student)
 
-            unwrapped_teacher = self.accelerator.unwrap_model(self.teacher_model)
+            unwrapped_teacher = self.accelerator.unwrap_model(teacher_model_selected)
             base_teacher = getattr(unwrapped_teacher, getattr(unwrapped_teacher, 'base_model_prefix', 'model'),
                                    unwrapped_teacher)
 
             # Forward through base models
             student_outputs = base_student(**model_inputs, use_cache=False)
 
-            load_context = self.load_teacher_model_context() if self.args.offload_teacher_model else nullcontext()
+            load_context = (self._load_single_teacher_context(teacher_idx)
+                            if self.args.offload_teacher_model else nullcontext())
             with load_context:
-                with torch.no_grad(), disable_gradient_checkpointing(self.teacher_model,
+                with torch.no_grad(), disable_gradient_checkpointing(teacher_model_selected,
                                                                      self.args.gradient_checkpointing_kwargs):
                     teacher_outputs = base_teacher(**model_inputs, use_cache=False)
 
@@ -203,7 +335,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 teacher_head = unwrapped_teacher.get_output_embeddings()
 
                 # Prepare context managers for gathering parameters in zero3
-                teacher_context = get_gather_if_zero3_context(self, is_zero3=self.is_teacher_ds3)(teacher_head.weight)
+                teacher_context = get_gather_if_zero3_context(self, is_zero3=is_ds3_selected)(teacher_head.weight)
                 student_context = get_gather_if_zero3_context(self)(student_head.weight)
 
                 with teacher_context, student_context:
@@ -223,6 +355,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 # Release hidden states after loss computation
                 del student_hidden, teacher_hidden, true_labels
         else:
+            if self.use_liger_gkd_loss and use_multi_teacher:
+                logger.warning_once(
+                    'Liger GKD loss is not supported with mixed-teacher batches. Falling back to standard path.')
+
             # Standard loss computation
             if self.args.sft_alpha > 0:
                 model_inputs['labels'] = inputs['labels']
@@ -230,15 +366,25 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             outputs_student = model(**model_inputs)
 
             model_inputs.pop('labels', None)
-            load_context = self.load_teacher_model_context() if self.args.offload_teacher_model else nullcontext()
-            with torch.no_grad(), load_context, disable_gradient_checkpointing(self.teacher_model,
-                                                                               self.args.gradient_checkpointing_kwargs):
-                outputs_teacher = self.teacher_model(**model_inputs)
+
+            if not use_multi_teacher:
+                # Single teacher for all samples (original behavior)
+                teacher_idx = teacher_indices[0] if teacher_indices else 0
+                teacher_model_selected = self.teacher_models[teacher_idx]
+                load_context = (self._load_single_teacher_context(teacher_idx)
+                                if self.args.offload_teacher_model else nullcontext())
+                with torch.no_grad(), load_context, disable_gradient_checkpointing(
+                        teacher_model_selected, self.args.gradient_checkpointing_kwargs):
+                    outputs_teacher = teacher_model_selected(**model_inputs)
+                teacher_logits = outputs_teacher.logits
+            else:
+                # Per-sample routing: multiple teachers in one batch
+                teacher_logits = self._multi_teacher_forward(model_inputs, teacher_indices)
 
             shifted_labels = torch.roll(inputs['labels'], shifts=-1, dims=1)
             mask = shifted_labels != -100
             shifted_student_logits = outputs_student.logits[mask][None]
-            shifted_teacher_logits = outputs_teacher.logits[mask][None]
+            shifted_teacher_logits = teacher_logits[mask][None]
 
             # Fix the vocab_size mismatch between Qwen2.5-VL-3B-Instruct and Qwen2.5-VL-7B-Instruct.
             stu_dim = shifted_student_logits.shape[-1]
@@ -360,11 +506,23 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 # Resample inputs that fail encoding when truncation_strategy is 'raise'('delete')
                 if self.template.truncation_strategy == 'raise':
                     inputs = self.resample_encode_failed_inputs(inputs)
+
+                # For multi-teacher seq_kd, pick the majority teacher for generation
+                # (generation must use a single model; soft labels still route per-sample in compute_loss)
+                channels = [inp.get('channel') for inp in inputs] if isinstance(inputs, list) else None
+                teacher_indices = self._get_teacher_indices(channels)
+                if teacher_indices is not None:
+                    from collections import Counter
+                    teacher_idx = Counter(teacher_indices).most_common(1)[0][0]
+                else:
+                    teacher_idx = 0
+
                 # Need prompt-only encoding for teacher generation
                 encoded_inputs = self._prepare_batch_inputs(inputs, encode_prompt_only=True)
-                load_context = self.load_teacher_model_context() if self.args.offload_teacher_model else nullcontext()
+                load_context = (self._load_single_teacher_context(teacher_idx)
+                                if self.args.offload_teacher_model else nullcontext())
                 with load_context, unwrap_model_for_generation(
-                        self.teacher_model,
+                        self.teacher_models[teacher_idx],
                         self.accelerator,
                         gather_deepspeed3_params=self.teacher_ds3_gather_for_generation) as unwrapped_model:
                     unwrapped_model.eval()
@@ -436,16 +594,9 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
     @contextmanager
     def load_teacher_model_context(self):
-        """
-        Context manager to load and offload the teacher model with memory and timing profiling.
-        """
-        if not self.args.offload_teacher_model:
+        """Backward-compatible: loads the first (or only) teacher."""
+        with self._load_single_teacher_context(0):
             yield
-            return
-
-        self.load_model(self.accelerator.unwrap_model(self.teacher_model))
-        yield
-        self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
 
     def _prepare_liger_loss(self):
         """Initialize liger loss if enabled."""
