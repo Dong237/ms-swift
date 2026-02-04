@@ -172,7 +172,7 @@ The `custom_dataset_info.json` stays the same — no changes needed there.
 
 | Capability | Estimated Lines |
 |---|---|
-| `teacher_domain_map` CLI arg + validation + dedup | ~30 lines new in `rlhf_args.py` |
+| `teacher_domain_map` + `teacher_type_map` CLI args + validation + dedup | ~50 lines new in `rlhf_args.py` |
 | Multi-teacher loading in pipeline | ~40 lines new in `rlhf.py` |
 | Multi-teacher init in GKDTrainer | ~30 lines modified in `gkd_trainer.py` |
 | Per-sample routing in `compute_loss` | ~60 lines new in `gkd_trainer.py` |
@@ -266,9 +266,30 @@ def _check_gkd(self):
 
 **Design rationale**: By mapping `channel → model_path` directly, users never need to worry about matching positional indices between `--teacher_model` order and `--teacher_domain_map` integers. Multiple domains can share the same teacher model path — deduplication ensures it's loaded only once.
 
+**Step 1.2b**: Add `teacher_type_map` to `RLHFArguments` (optional, for per-teacher model type overrides)
+
+Fine-tuned models often fail auto-detection (e.g., Qwen3 fine-tunes). Use `--teacher_type_map` to explicitly specify model types per domain:
+
+```python
+    teacher_type_map: Optional[str] = field(
+        default=None,
+        metadata={'help': 'JSON string mapping channel names to teacher model types. '
+                  'e.g. \'{"math": "qwen3", "code": "qwen3"}\'. '
+                  'Keys must be a subset of --teacher_domain_map keys. '
+                  'Omitted domains fall back to auto-detection.'})
+```
+
+Validation in `_check_gkd()`:
+- `teacher_type_map` requires `teacher_domain_map` (error otherwise)
+- Keys must exist in `teacher_domain_map`
+- If two domains share the same teacher path, they must specify the same model_type
+- Builds `self._teacher_types` list aligned with `self._teacher_paths` (None = auto-detect)
+
+**Common model_type values**: `qwen3`, `qwen2`, `qwen3_moe`, `llama`, `deepseek_v3`, `glm4`, `internlm3`, `mistral`, `gemma2`, `phi4`, `minicpm3`. Full list available via `swift.model.MODEL_MAPPING.keys()`.
+
 #### File: `swift/rlhf_trainers/arguments.py`
 
-**Step 1.4**: No changes needed to `GKDConfig` — the `teacher_domain_map` is consumed at the `RLHFArguments` level and does not need to be in HuggingFace `TrainingArguments`.
+**Step 1.4**: No changes needed to `GKDConfig` — `teacher_domain_map` and `teacher_type_map` are consumed at the `RLHFArguments` level.
 
 ---
 
@@ -330,10 +351,11 @@ def _load_teacher_models(self):
         teacher_models = []
         original_teacher_model = args.teacher_model
 
-        for teacher_path in teacher_paths:
+        teacher_types = args._teacher_types or [None] * len(teacher_paths)
+        for teacher_path, model_type in zip(teacher_paths, teacher_types):
             args.teacher_model = teacher_path  # Temporarily set for _prepare_single_model
-            # model_type=None triggers auto-detection in _prepare_single_model
-            result = self._prepare_single_model('teacher', 'teacher', None, None)
+            # model_type from teacher_type_map, or None for auto-detection
+            result = self._prepare_single_model('teacher', 'teacher', model_type, None)
             if result is not None:
                 model, _ = result
                 teacher_models.append(model)
@@ -809,6 +831,10 @@ TEACHER_DOMAIN_MAP="{
   \"general\": \"$GENERAL_TEACHER\"
 }"
 
+# teacher_type_map (optional): specify model types when auto-detection fails
+# Omit domains that auto-detect correctly. Only needed for fine-tuned models.
+TEACHER_TYPE_MAP='{"math": "qwen3", "code": "qwen3", "general": "qwen3"}'
+
 run_name="Livelm-1.7B-multi-teacher-gkd-3teachers"
 OUTPUT_DIR="/mnt/bn/youxiang-lf/models/$run_name"
 export WANDB_NAME="$run_name"
@@ -825,6 +851,7 @@ swift rlhf \
     --model $STUDENT_MODEL \
     --model_type qwen3 \
     --teacher_domain_map "$TEACHER_DOMAIN_MAP" \
+    --teacher_type_map "$TEACHER_TYPE_MAP" \
     --train_type full \
     --custom_dataset_info $CUSTOM_DATASET_INFO \
     --dataset $DATASET \
@@ -864,15 +891,16 @@ swift rlhf \
     --sleep_level 1 | tee -a $OUTPUT_DIR/log.txt
 ```
 
-**Key UX improvement**: No `--teacher_model` or `--teacher_model_type` needed! The `--teacher_domain_map` JSON directly maps each domain to its teacher path. Model types are auto-detected. If two domains share the same teacher path, the model is loaded only once.
+**Key UX improvement**: No `--teacher_model` needed! The `--teacher_domain_map` JSON directly maps each domain to its teacher path. Model types are auto-detected by default, or explicitly specified via `--teacher_type_map` when auto-detection fails (common with fine-tuned models). If two domains share the same teacher path, the model is loaded only once.
 
 ### 7.3 Key Differences from Single-Teacher Script
 
 | Parameter | Single-Teacher | Multi-Teacher |
 |---|---|---|
 | `--teacher_model` | One path | **Not used** |
-| `--teacher_model_type` | One type (optional) | **Not used** (auto-detected) |
+| `--teacher_model_type` | One type (optional) | **Not used** — use `--teacher_type_map` instead |
 | `--teacher_domain_map` | Not used | JSON mapping channel → teacher **path** |
+| `--teacher_type_map` | Not used | JSON mapping channel → model type (optional, for fine-tuned models) |
 | `--offload_teacher_model` | Optional | Recommended (saves GPU memory) |
 | Data format | No `channel` field needed | Each row needs `"channel": "domain_name"` |
 | Everything else | Same | Same |

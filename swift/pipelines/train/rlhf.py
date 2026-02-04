@@ -121,9 +121,10 @@ class SwiftRLHF(SwiftSft):
             # Multi-teacher mode
             teacher_models = []
             original_teacher_model = args.teacher_model
-            for teacher_path in args._teacher_paths:
+            teacher_types = args._teacher_types or [None] * len(args._teacher_paths)
+            for teacher_path, model_type in zip(args._teacher_paths, teacher_types):
                 args.teacher_model = teacher_path
-                result = self._prepare_single_model('teacher', 'teacher', None, None)
+                result = self._prepare_single_model('teacher', 'teacher', model_type, None)
                 if result is not None:
                     model, _ = result
                     teacher_models.append(model)

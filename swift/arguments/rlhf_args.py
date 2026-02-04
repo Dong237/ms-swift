@@ -202,6 +202,9 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         teacher_domain_map (Optional[str]): JSON string mapping data channel names to teacher model paths for
             multi-teacher GKD. Each training sample is routed to its assigned teacher based on the 'channel' field.
             Mutually exclusive with --teacher_model. Defaults to None.
+        teacher_type_map (Optional[str]): JSON string mapping channel names to teacher model types for
+            multi-teacher GKD. Keys must be a subset of --teacher_domain_map keys. Omitted domains fall back to
+            auto-detection. Only used with --teacher_domain_map. Defaults to None.
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
             Defaults to None.
     """
@@ -247,6 +250,16 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             'e.g. \'{"math": "/path/to/math_teacher", "code": "/path/to/code_teacher"}\'. '
             'Mutually exclusive with --teacher_model (single-teacher). '
             'Each data sample must have a "channel" field matching one of the keys.'
+        })
+    teacher_type_map: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'JSON string mapping channel names to teacher model types for multi-teacher GKD. '
+            'e.g. \'{"math": "qwen3", "code": "qwen3"}\'. '
+            'Keys must be a subset of --teacher_domain_map keys. '
+            'Omitted domains fall back to auto-detection. '
+            f'Allowed model_type values: {list(MODEL_MAPPING.keys())}'
         })
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
@@ -607,3 +620,32 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             logger.info(f'Multi-teacher GKD: {len(unique_paths)} unique teacher(s) '
                         f'for {len(self.teacher_domain_map)} domain(s)')
             logger.info(f'  Channel->teacher mapping: {self._channel_to_teacher_idx}')
+
+        # Parse teacher_type_map (optional per-teacher model type overrides)
+        self._teacher_types = None
+        if self.teacher_type_map is not None:
+            if self.teacher_domain_map is None:
+                raise ValueError('--teacher_type_map requires --teacher_domain_map.')
+            import json
+            if isinstance(self.teacher_type_map, str):
+                self.teacher_type_map = json.loads(self.teacher_type_map)
+            if not isinstance(self.teacher_type_map, dict):
+                raise ValueError(f'teacher_type_map must be a JSON dict, got {type(self.teacher_type_map)}')
+            for domain in self.teacher_type_map:
+                if domain not in self.teacher_domain_map:
+                    raise ValueError(
+                        f'teacher_type_map key "{domain}" not found in teacher_domain_map. '
+                        f'Valid keys: {list(self.teacher_domain_map.keys())}')
+            # Validate: same path must have same model_type
+            path_to_type = {}
+            for domain, model_path in self.teacher_domain_map.items():
+                mt = self.teacher_type_map.get(domain)
+                if mt is not None:
+                    if model_path in path_to_type and path_to_type[model_path] != mt:
+                        raise ValueError(
+                            f'Conflicting model types for teacher path "{model_path}": '
+                            f'"{path_to_type[model_path]}" vs "{mt}"')
+                    path_to_type[model_path] = mt
+            # Build _teacher_types aligned with _teacher_paths (None = auto-detect)
+            self._teacher_types = [path_to_type.get(p) for p in self._teacher_paths]
+            logger.info(f'  Teacher model types: {self._teacher_types}')
