@@ -215,6 +215,11 @@ The fused Liger JSD loss (`--use_liger_kernel true`) operates on hidden states a
 - Homogeneous batches: Liger kernel is used
 - Mixed batches: Falls back to standard loss path with a one-time warning
 
+## Scope & Limitations
+
+- **Backend scope**: Multi-teacher GKD is implemented for the HuggingFace/DeepSpeed/FSDP training path (`swift rlhf`). Megatron GKD currently supports **single-teacher only**.
+- **Padding-free / packing**: Multi-teacher routing is **not compatible** with `--padding_free` or `--packing` because channel metadata becomes per-packed-sample while routing assumes per-batch samples. Keep these flags **disabled** when using `--teacher_domain_map`.
+
 ## Common Issues
 
 ### "teacher_domain_map and teacher_model are mutually exclusive"

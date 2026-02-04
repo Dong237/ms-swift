@@ -2,6 +2,9 @@
 
 This guide describes how to test the multi-teacher GKD feature in various environments.
 
+> Scope note: These tests target the **HuggingFace/DeepSpeed/FSDP** training path (`swift rlhf`).
+> Megatron GKD currently supports **single-teacher only** and is not covered here.
+
 ## Prerequisites
 
 - Python >= 3.9
@@ -10,6 +13,7 @@ This guide describes how to test the multi-teacher GKD feature in various enviro
 - pytest (`pip install pytest`)
 - At least 1 GPU (24 GB VRAM recommended for Qwen2.5-0.5B tests)
 - Internet access for model downloads (first run only)
+- Ensure `--padding_free` and `--packing` are **disabled** when using `--teacher_domain_map`
 
 ## 1. Unit Tests (No GPU Required)
 

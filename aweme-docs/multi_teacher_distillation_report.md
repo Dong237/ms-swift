@@ -944,3 +944,8 @@ Internally: 2 unique teachers loaded (not 3). Both "math" and "physics" channels
 ### 8.6 vLLM Colocate/Server Mode
 
 **No challenge**: vLLM is used for **student** on-policy generation, not teacher generation. Multi-teacher routing only affects `compute_loss` (soft label computation). The vLLM rollout infrastructure is completely unaffected.
+
+### 8.7 Scope Limitations (Current)
+
+- **Megatron backend**: Multi-teacher is implemented for the HuggingFace/DeepSpeed/FSDP path only. Megatron GKD currently accepts a single `teacher_model` and is out of scope for this upgrade.
+- **Padding-free / packing**: Multi-teacher routing assumes `channel` is a per-sample field. With `--padding_free` or `--packing`, channels become per-packed-sample and routing is ambiguous. Keep these flags **disabled** when using `--teacher_domain_map`.
