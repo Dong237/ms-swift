@@ -350,6 +350,119 @@ class TestMultiTeacherGKDIntegration:
         assert result is not None
 
 
+# ---------------------------------------------------------------------------
+# Unit tests — vocab padding logic (no GPU required)
+# ---------------------------------------------------------------------------
+
+class TestVocabPadding:
+    """Test that vocab mismatch padding uses -1e9 (not 0) to avoid spurious probability mass."""
+
+    def test_pad_smaller_teacher_uses_neg_inf(self):
+        """When a teacher has smaller vocab, padded positions should be -1e9."""
+        import torch
+        import torch.nn.functional as F
+
+        # Simulate: teacher A has vocab 100, teacher B has vocab 120
+        # After teacher A, max_vocab=100. Teacher B expands to 120.
+        # Teacher A's padded positions (100-119) should be -1e9.
+        teacher_a_logits = torch.randn(2, 5, 100)  # 2 samples, 5 tokens, vocab 100
+        max_vocab_size = 100
+
+        # Simulate expansion when teacher B has vocab 120
+        new_vocab_size = 120
+        padded = F.pad(teacher_a_logits, (0, new_vocab_size - max_vocab_size), 'constant', -1e9)
+
+        assert padded.shape == (2, 5, 120)
+        # Original positions should be unchanged
+        assert torch.allclose(padded[:, :, :100], teacher_a_logits)
+        # Padded positions should be -1e9
+        assert (padded[:, :, 100:] == -1e9).all()
+
+    def test_pad_value_gives_zero_softmax_probability(self):
+        """Padding with -1e9 should give ~0 probability after softmax."""
+        import torch
+        import torch.nn.functional as F
+
+        logits = torch.randn(1, 3, 50)
+        padded = F.pad(logits, (0, 10), 'constant', -1e9)  # pad 10 extra positions
+        probs = F.softmax(padded, dim=-1)
+
+        # Padded positions should have negligible probability
+        assert probs[:, :, 50:].max().item() < 1e-30
+        # Original positions should still sum to ~1
+        assert torch.allclose(probs.sum(dim=-1), torch.ones(1, 3), atol=1e-6)
+
+    def test_pad_value_no_nan_in_kl_div(self):
+        """Using -1e9 padding should not produce NaN in KL divergence (unlike -inf)."""
+        import torch
+        import torch.nn.functional as F
+
+        student_logits = torch.randn(1, 10, 60)
+        teacher_logits = torch.randn(1, 10, 50)
+        # Pad teacher to match student vocab
+        teacher_logits = F.pad(teacher_logits, (0, 10), 'constant', -1e9)
+
+        s_log_probs = F.log_softmax(student_logits, dim=-1)
+        t_log_probs = F.log_softmax(teacher_logits, dim=-1)
+
+        kl = F.kl_div(s_log_probs, t_log_probs, reduction='none', log_target=True)
+        assert not torch.isnan(kl).any(), 'KL divergence should not contain NaN with -1e9 padding'
+        assert not torch.isinf(kl).any(), 'KL divergence should not contain Inf with -1e9 padding'
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — channel preservation (no GPU required)
+# ---------------------------------------------------------------------------
+
+class TestChannelPreservation:
+    """Test that channel field is preserved through vLLM and seq_kd paths."""
+
+    def test_vllm_channel_reattachment(self):
+        """Channels from original inputs should be reattached to vLLM-generated outputs."""
+        # Simulate the fix: preserve channels before vLLM, reattach after
+        original_inputs = [
+            {'messages': [{'role': 'user', 'content': 'q1'}], 'channel': 'math'},
+            {'messages': [{'role': 'user', 'content': 'q2'}], 'channel': 'code'},
+            {'messages': [{'role': 'user', 'content': 'q3'}], 'channel': 'math'},
+        ]
+        # vLLM returns only messages (no channel)
+        vllm_outputs = [
+            {'messages': [{'role': 'user', 'content': 'q1'}, {'role': 'assistant', 'content': 'a1'}]},
+            {'messages': [{'role': 'user', 'content': 'q2'}, {'role': 'assistant', 'content': 'a2'}]},
+            {'messages': [{'role': 'user', 'content': 'q3'}, {'role': 'assistant', 'content': 'a3'}]},
+        ]
+
+        # Apply the fix
+        original_channels = [inp.get('channel') for inp in original_inputs]
+        for gen_inp, ch in zip(vllm_outputs, original_channels):
+            if ch is not None:
+                gen_inp['channel'] = ch
+
+        assert vllm_outputs[0]['channel'] == 'math'
+        assert vllm_outputs[1]['channel'] == 'code'
+        assert vllm_outputs[2]['channel'] == 'math'
+
+    def test_none_channels_not_attached(self):
+        """When original inputs have no channel, nothing should be attached."""
+        original_inputs = [
+            {'messages': [{'role': 'user', 'content': 'q1'}]},
+            {'messages': [{'role': 'user', 'content': 'q2'}]},
+        ]
+        vllm_outputs = [
+            {'messages': [{'role': 'user', 'content': 'q1'}, {'role': 'assistant', 'content': 'a1'}]},
+            {'messages': [{'role': 'user', 'content': 'q2'}, {'role': 'assistant', 'content': 'a2'}]},
+        ]
+
+        original_channels = [inp.get('channel') for inp in original_inputs]
+        for gen_inp, ch in zip(vllm_outputs, original_channels):
+            if ch is not None:
+                gen_inp['channel'] = ch
+
+        assert 'channel' not in vllm_outputs[0]
+        assert 'channel' not in vllm_outputs[1]
+
+
 if __name__ == '__main__':
     # Run unit tests (no GPU required)
-    pytest.main([__file__, '-v', '-k', 'TestTeacherDomainMapParsing or TestGetTeacherIndices'])
+    pytest.main([__file__, '-v', '-k', 'TestTeacherDomainMapParsing or TestGetTeacherIndices'
+                 ' or TestVocabPadding or TestChannelPreservation'])

@@ -204,12 +204,13 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                     batch_size, seq_len, vocab_size,
                     dtype=subset_logits.dtype, device=device)
             elif vocab_size > max_vocab_size:
-                # Expand to accommodate larger vocab
-                teacher_logits = F.pad(teacher_logits, (0, vocab_size - max_vocab_size), 'constant', 0)
+                # Expand to accommodate larger vocab; use -1e9 so softmax gives ~0 probability
+                # for tokens the smaller teacher doesn't have (avoids spurious probability mass)
+                teacher_logits = F.pad(teacher_logits, (0, vocab_size - max_vocab_size), 'constant', -1e9)
                 max_vocab_size = vocab_size
             elif vocab_size < max_vocab_size:
-                # Pad this teacher's logits to match
-                subset_logits = F.pad(subset_logits, (0, max_vocab_size - vocab_size), 'constant', 0)
+                # Pad this teacher's logits to match; -1e9 for tokens it doesn't have
+                subset_logits = F.pad(subset_logits, (0, max_vocab_size - vocab_size), 'constant', -1e9)
 
             # Scatter subset logits back into full batch
             teacher_logits[sample_idxs_tensor] = subset_logits
@@ -228,6 +229,75 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             yield
         finally:
             self.offload_model(teacher)
+
+    def _seq_kd_per_teacher_generate(self, inputs, channels, teacher_indices):
+        """Generate seq_kd responses per-teacher so each sample gets text from its assigned teacher.
+
+        Args:
+            inputs: raw list of input dicts
+            channels: list of channel strings (one per sample)
+            teacher_indices: list of int teacher indices (one per sample)
+
+        Returns:
+            encoded_inputs dict with input_ids, attention_mask, labels, and channel
+        """
+        pad_token_id = self.processing_class.pad_token_id
+
+        # Group samples by teacher
+        teacher_to_samples = defaultdict(list)
+        for i, tidx in enumerate(teacher_indices):
+            teacher_to_samples[tidx].append(i)
+
+        # Per-sample results: (input_ids_1d, attention_mask_1d, labels_1d)
+        results = {}
+        max_seq_len = 0
+
+        for tidx, sample_idxs in teacher_to_samples.items():
+            subset_inputs = [inputs[i] for i in sample_idxs]
+            subset_encoded = self._prepare_batch_inputs(subset_inputs, encode_prompt_only=True)
+
+            load_context = (self._load_single_teacher_context(tidx)
+                            if self.args.offload_teacher_model else nullcontext())
+            with load_context, unwrap_model_for_generation(
+                    self.teacher_models[tidx],
+                    self.accelerator,
+                    gather_deepspeed3_params=self.teacher_ds3_gather_for_generation) as unwrapped_model:
+                unwrapped_model.eval()
+                new_ids, new_mask, new_labels = self.generate_on_policy_outputs(
+                    unwrapped_model, subset_encoded, self.generation_config, pad_token_id)
+
+            max_seq_len = max(max_seq_len, new_ids.shape[1])
+            for local_i, global_i in enumerate(sample_idxs):
+                results[global_i] = (new_ids[local_i], new_mask[local_i], new_labels[local_i])
+
+        # Pad all samples to max_seq_len and stack in original order
+        batch_ids, batch_mask, batch_labels = [], [], []
+        for i in range(len(inputs)):
+            ids, mask, labels = results[i]
+            pad_len = max_seq_len - ids.shape[0]
+            if pad_len > 0:
+                ids = F.pad(ids, (0, pad_len), value=pad_token_id)
+                mask = F.pad(mask, (0, pad_len), value=0)
+                labels = F.pad(labels, (0, pad_len), value=-100)
+            batch_ids.append(ids)
+            batch_mask.append(mask)
+            batch_labels.append(labels)
+
+        encoded_inputs = {
+            'input_ids': torch.stack(batch_ids),
+            'attention_mask': torch.stack(batch_mask),
+            'labels': torch.stack(batch_labels),
+        }
+        # Preserve channels for routing in compute_loss
+        if any(ch is not None for ch in channels):
+            encoded_inputs['channel'] = channels
+
+        # Compute position_ids from attention_mask
+        position_ids = encoded_inputs['attention_mask'].cumsum(dim=1) - 1
+        position_ids[position_ids < 0] = 0
+        encoded_inputs['position_ids'] = position_ids
+
+        return encoded_inputs
 
     # Code borrowed from huggingface/trl
     def generate_on_policy_outputs(self, model, inputs, generation_config, pad_token_id=None):
@@ -473,7 +543,13 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                     inputs = self.resample_encode_failed_inputs(inputs)
                 if args.use_vllm:
                     processed_inputs = self._preprocess_inputs(inputs)
+                    # Preserve channels before vLLM inference — vLLM drops metadata fields
+                    original_channels = [inp.get('channel') for inp in inputs]
                     generated_inputs = self._fast_infer(processed_inputs)
+                    # Reattach channels for multi-teacher routing in compute_loss
+                    for gen_inp, ch in zip(generated_inputs, original_channels):
+                        if ch is not None:
+                            gen_inp['channel'] = ch
                     if self.log_completions:
                         messages = [inp['messages'][:-1] for inp in generated_inputs]
                         completions = [deepcopy(inp['messages'][-1]['content']) for inp in generated_inputs]
@@ -507,31 +583,30 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 if self.template.truncation_strategy == 'raise':
                     inputs = self.resample_encode_failed_inputs(inputs)
 
-                # For multi-teacher seq_kd, pick the majority teacher for generation
-                # (generation must use a single model; soft labels still route per-sample in compute_loss)
                 channels = [inp.get('channel') for inp in inputs] if isinstance(inputs, list) else None
                 teacher_indices = self._get_teacher_indices(channels)
-                if teacher_indices is not None:
-                    from collections import Counter
-                    teacher_idx = Counter(teacher_indices).most_common(1)[0][0]
-                else:
-                    teacher_idx = 0
 
-                # Need prompt-only encoding for teacher generation
-                encoded_inputs = self._prepare_batch_inputs(inputs, encode_prompt_only=True)
-                load_context = (self._load_single_teacher_context(teacher_idx)
-                                if self.args.offload_teacher_model else nullcontext())
-                with load_context, unwrap_model_for_generation(
-                        self.teacher_models[teacher_idx],
-                        self.accelerator,
-                        gather_deepspeed3_params=self.teacher_ds3_gather_for_generation) as unwrapped_model:
-                    unwrapped_model.eval()
-                    new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
-                        unwrapped_model, encoded_inputs, self.generation_config, self.processing_class.pad_token_id)
-                # override with generated inputs
-                encoded_inputs['input_ids'] = new_input_ids
-                encoded_inputs['attention_mask'] = new_attention_mask
-                encoded_inputs['labels'] = new_labels
+                if teacher_indices is not None and len(set(teacher_indices)) > 1:
+                    # Multi-teacher seq_kd: generate per-teacher so each sample gets
+                    # text from its assigned teacher (not just the majority teacher)
+                    encoded_inputs = self._seq_kd_per_teacher_generate(inputs, channels, teacher_indices)
+                else:
+                    # Single teacher (original path)
+                    teacher_idx = teacher_indices[0] if teacher_indices else 0
+                    encoded_inputs = self._prepare_batch_inputs(inputs, encode_prompt_only=True)
+                    load_context = (self._load_single_teacher_context(teacher_idx)
+                                    if self.args.offload_teacher_model else nullcontext())
+                    with load_context, unwrap_model_for_generation(
+                            self.teacher_models[teacher_idx],
+                            self.accelerator,
+                            gather_deepspeed3_params=self.teacher_ds3_gather_for_generation) as unwrapped_model:
+                        unwrapped_model.eval()
+                        new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
+                            unwrapped_model, encoded_inputs, self.generation_config,
+                            self.processing_class.pad_token_id)
+                    encoded_inputs['input_ids'] = new_input_ids
+                    encoded_inputs['attention_mask'] = new_attention_mask
+                    encoded_inputs['labels'] = new_labels
 
             else:
                 # Off-policy: use dataset responses, encode full messages
