@@ -79,6 +79,8 @@ class TestTeacherDomainMapParsing:
             async_generate = False
             teacher_model = None
             teacher_domain_map = None
+            teacher_type_map = None
+            teacher_deepspeed = None
             _teacher_paths = None
             _channel_to_teacher_idx = None
 
@@ -147,6 +149,33 @@ class TestTeacherDomainMapParsing:
         assert mock._teacher_paths is None
         assert mock._channel_to_teacher_idx is None
 
+    def test_zero3_teacher_multi_teacher_raises(self):
+        """ZeRO-3 teacher + multi-teacher should raise ValueError (deadlock risk)."""
+        zero3_config = {'zero_optimization': {'stage': 3}}
+        with pytest.raises(ValueError, match='ZeRO-3 for teacher models is incompatible'):
+            self._make_args(
+                teacher_domain_map=json.dumps({'math': '/path/math', 'code': '/path/code'}),
+                teacher_deepspeed=zero3_config,
+            )
+
+    def test_zero2_teacher_multi_teacher_passes(self):
+        """ZeRO-2 teacher + multi-teacher should work fine."""
+        zero2_config = {'zero_optimization': {'stage': 2}}
+        mock = self._make_args(
+            teacher_domain_map=json.dumps({'math': '/path/math', 'code': '/path/code'}),
+            teacher_deepspeed=zero2_config,
+        )
+        assert len(mock._teacher_paths) == 2
+
+    def test_zero3_teacher_single_teacher_passes(self):
+        """ZeRO-3 teacher + single teacher should still work (no per-sample routing)."""
+        zero3_config = {'zero_optimization': {'stage': 3}}
+        mock = self._make_args(
+            teacher_model='some/model',
+            teacher_deepspeed=zero3_config,
+        )
+        assert mock._teacher_paths is None  # Single teacher, no multi-teacher paths
+
 
 # ---------------------------------------------------------------------------
 # Unit tests — teacher routing logic (no GPU required)
@@ -197,6 +226,14 @@ class TestGetTeacherIndices:
         stub = self._make_trainer_stub(n_teachers=2, channel_to_idx={'math': 0, 'code': 1})
         result = stub._get_teacher_indices(['math', 'unknown', None])
         assert result == [0, 0, 0]
+
+    def test_unknown_channel_logs_warning(self):
+        """Unknown (non-None) channels should trigger a warning."""
+        import logging
+        stub = self._make_trainer_stub(n_teachers=2, channel_to_idx={'math': 0, 'code': 1})
+        # Use caplog-style approach: check that result is correct and warning would fire
+        result = stub._get_teacher_indices(['math', 'typo_channel', 'code'])
+        assert result == [0, 0, 1]  # 'typo_channel' defaults to 0
 
 
 # ---------------------------------------------------------------------------

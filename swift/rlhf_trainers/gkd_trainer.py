@@ -152,6 +152,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             if ch is not None and ch in self.channel_to_teacher_idx:
                 indices.append(self.channel_to_teacher_idx[ch])
             else:
+                if ch is not None:
+                    logger.warning_once(
+                        f'Channel "{ch}" not found in teacher_domain_map. '
+                        f'Defaulting to teacher[0]. Valid channels: {list(self.channel_to_teacher_idx.keys())}')
                 indices.append(0)  # Default to first teacher
         return indices
 

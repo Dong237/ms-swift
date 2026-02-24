@@ -621,6 +621,18 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
                         f'for {len(self.teacher_domain_map)} domain(s)')
             logger.info(f'  Channel->teacher mapping: {self._channel_to_teacher_idx}')
 
+        # Validate: ZeRO-3 for teacher is incompatible with multi-teacher per-sample routing.
+        # Different ranks may have different teacher subsets in their micro-batches, causing
+        # AllGather deadlocks when ZeRO-3 tries to synchronize parameter gathering.
+        if self.teacher_domain_map is not None and self.teacher_deepspeed:
+            teacher_ds = self.teacher_deepspeed if isinstance(self.teacher_deepspeed, dict) else {}
+            teacher_stage = teacher_ds.get('zero_optimization', {}).get('stage', 0)
+            if teacher_stage == 3:
+                raise ValueError(
+                    'ZeRO-3 for teacher models is incompatible with multi-teacher per-sample routing. '
+                    'Different ranks may route to different teachers, causing AllGather deadlocks. '
+                    'Use --teacher_deepspeed zero2 or zero2_offload instead.')
+
         # Parse teacher_type_map (optional per-teacher model type overrides)
         self._teacher_types = None
         if self.teacher_type_map is not None:
