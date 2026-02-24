@@ -229,11 +229,28 @@ class TestGetTeacherIndices:
 
     def test_unknown_channel_logs_warning(self):
         """Unknown (non-None) channels should trigger a warning."""
-        import logging
         stub = self._make_trainer_stub(n_teachers=2, channel_to_idx={'math': 0, 'code': 1})
         # Use caplog-style approach: check that result is correct and warning would fire
         result = stub._get_teacher_indices(['math', 'typo_channel', 'code'])
         assert result == [0, 0, 1]  # 'typo_channel' defaults to 0
+
+    def test_all_same_channel(self):
+        """All samples have the same channel — all route to the same teacher."""
+        stub = self._make_trainer_stub(n_teachers=2, channel_to_idx={'math': 0, 'code': 1})
+        result = stub._get_teacher_indices(['math', 'math', 'math'])
+        assert result == [0, 0, 0]
+
+    def test_empty_channels_list(self):
+        """Empty channels list should return empty indices (not None)."""
+        stub = self._make_trainer_stub(n_teachers=2, channel_to_idx={'math': 0, 'code': 1})
+        result = stub._get_teacher_indices([])
+        assert result == []
+
+    def test_mixed_known_unknown_none(self):
+        """Mix of known, unknown, and None channels."""
+        stub = self._make_trainer_stub(n_teachers=3, channel_to_idx={'a': 0, 'b': 1, 'c': 2})
+        result = stub._get_teacher_indices(['a', 'unknown', None, 'b', 'c', 'also_unknown'])
+        assert result == [0, 0, 0, 1, 2, 0]  # unknown and None default to 0
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +402,57 @@ class TestMultiTeacherGKDIntegration:
                 **kwargs,
             ))
         assert result is not None
+
+    def test_multi_teacher_on_policy(self):
+        """On-policy student generation with multi-teacher routing (validates channel preservation)."""
+        from swift import RLHFArguments, rlhf_main
+
+        teacher_domain_map = json.dumps({
+            'math': 'Qwen/Qwen2.5-0.5B',
+            'code': 'Qwen/Qwen2.5-0.5B',
+        })
+
+        result = rlhf_main(
+            RLHFArguments(
+                rlhf_type='gkd',
+                model='Qwen/Qwen2.5-0.5B',
+                teacher_domain_map=teacher_domain_map,
+                dataset=[self.channel_jsonl],
+                lmbda=1.0,  # Always on-policy (student generates)
+                max_completion_length=32,
+                split_dataset_ratio=0.0,
+                load_from_cache_file=False,
+                output_dir=os.path.join(self.tmp_dir, 'output_on_policy'),
+                **kwargs,
+            ))
+        assert result is not None
+        assert 'last_model_checkpoint' in result
+
+    def test_multi_teacher_seq_kd_per_teacher(self):
+        """Multi-teacher seq_kd with per-teacher generation (not majority vote)."""
+        from swift import RLHFArguments, rlhf_main
+
+        teacher_domain_map = json.dumps({
+            'math': 'Qwen/Qwen2.5-0.5B',
+            'code': 'Qwen/Qwen2.5-0.5B',
+        })
+
+        result = rlhf_main(
+            RLHFArguments(
+                rlhf_type='gkd',
+                model='Qwen/Qwen2.5-0.5B',
+                teacher_domain_map=teacher_domain_map,
+                dataset=[self.channel_jsonl],
+                seq_kd=True,
+                lmbda=0.0,  # Always seq_kd (no on-policy)
+                max_completion_length=32,
+                split_dataset_ratio=0.0,
+                load_from_cache_file=False,
+                output_dir=os.path.join(self.tmp_dir, 'output_seq_kd_per_teacher'),
+                **kwargs,
+            ))
+        assert result is not None
+        assert 'last_model_checkpoint' in result
 
 
 # ---------------------------------------------------------------------------
