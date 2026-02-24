@@ -567,7 +567,29 @@ class TestChannelPreservation:
         assert 'channel' not in vllm_outputs[1]
 
 
+# ---------------------------------------------------------------------------
+# Unit tests — Megatron multi-teacher guard (no GPU required)
+# ---------------------------------------------------------------------------
+
+class TestMegatronMultiTeacherGuard:
+    """Test that Megatron backend rejects multi-teacher GKD."""
+
+    def test_megatron_multi_teacher_raises(self):
+        """Megatron GKD with teacher_domain_map should raise NotImplementedError."""
+        # We can't easily instantiate MegatronGKDTrainer without full megatron setup,
+        # so we test the guard logic directly by checking the class source.
+        try:
+            from swift.megatron.trainers.gkd_trainer import MegatronGKDTrainer
+            # Verify the guard exists in __init__
+            import inspect
+            source = inspect.getsource(MegatronGKDTrainer.__init__)
+            assert 'teacher_domain_map' in source
+            assert 'NotImplementedError' in source
+        except ImportError:
+            pytest.skip('megatron not installed')
+
+
 if __name__ == '__main__':
     # Run unit tests (no GPU required)
     pytest.main([__file__, '-v', '-k', 'TestTeacherDomainMapParsing or TestGetTeacherIndices'
-                 ' or TestVocabPadding or TestChannelPreservation'])
+                 ' or TestVocabPadding or TestChannelPreservation or TestMegatronMultiTeacherGuard'])

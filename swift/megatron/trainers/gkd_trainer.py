@@ -37,6 +37,12 @@ class DataSource(str, Enum):
 class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def __init__(self, args: MegatronArguments, template, **kwargs):
+        # Multi-teacher GKD is not supported in Megatron backend
+        if getattr(args, 'teacher_domain_map', None):
+            raise NotImplementedError(
+                'Multi-teacher GKD (--teacher_domain_map) is not supported with the Megatron backend. '
+                'Use the standard (non-Megatron) training pipeline instead.')
+
         self.vllm_client = kwargs.pop('vllm_client', None)
         super().__init__(args, template)
 

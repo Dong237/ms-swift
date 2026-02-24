@@ -109,6 +109,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             logger.info(f'Multi-teacher GKD: initialized {len(self.teacher_models)} teacher(s)')
             if self.channel_to_teacher_idx:
                 logger.info(f'  Channel->teacher routing: {self.channel_to_teacher_idx}')
+            if not self.args.offload_teacher_model:
+                logger.warning(
+                    f'Multi-teacher GKD: {len(self.teacher_models)} teachers loaded to GPU simultaneously. '
+                    f'Consider --offload_teacher_model true to reduce peak GPU memory.')
 
         if self.args.offload_teacher_model:
             for tm in self.teacher_models:
@@ -431,7 +435,9 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         else:
             if self.use_liger_gkd_loss and use_multi_teacher:
                 logger.warning_once(
-                    'Liger GKD loss is not supported with mixed-teacher batches. Falling back to standard path.')
+                    'Liger GKD loss does not support mixed-teacher batches. Falling back to standard JSD, '
+                    'which uses more GPU memory. To avoid this: (1) set --use_liger_kernel false, or '
+                    '(2) sort dataset by channel so each batch uses a single teacher.')
 
             # Standard loss computation
             if self.args.sft_alpha > 0:
