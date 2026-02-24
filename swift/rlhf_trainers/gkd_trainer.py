@@ -423,7 +423,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         teacher_indices = self._get_teacher_indices(channels)
         use_multi_teacher = teacher_indices is not None and len(set(teacher_indices)) > 1
 
-        if self.use_liger_gkd_loss and not use_multi_teacher:
+        has_per_teacher_params = (self.channel_to_beta or self.channel_to_temperature) and channels
+        if self.use_liger_gkd_loss and not use_multi_teacher and not has_per_teacher_params:
             # Liger fused JSD loss for memory efficiency (single teacher only)
             teacher_idx = 0 if teacher_indices is None else teacher_indices[0]
             teacher_model_selected = self.teacher_models[teacher_idx]
@@ -497,6 +498,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                     'Liger GKD loss does not support mixed-teacher batches. Falling back to standard JSD, '
                     'which uses more GPU memory. To avoid this: (1) set --use_liger_kernel false, or '
                     '(2) sort dataset by channel so each batch uses a single teacher.')
+            elif self.use_liger_gkd_loss and has_per_teacher_params:
+                logger.warning_once(
+                    'Liger GKD loss does not support per-teacher beta/temperature. '
+                    'Falling back to standard JSD with grouped loss.')
 
             # Standard loss computation
             if self.args.sft_alpha > 0:
