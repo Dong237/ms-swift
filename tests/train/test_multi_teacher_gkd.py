@@ -81,6 +81,8 @@ class TestTeacherDomainMapParsing:
             teacher_domain_map = None
             teacher_type_map = None
             teacher_deepspeed = None
+            teacher_beta_map = None
+            teacher_temperature_map = None
             _teacher_paths = None
             _channel_to_teacher_idx = None
 
@@ -148,6 +150,55 @@ class TestTeacherDomainMapParsing:
         mock = self._make_args(teacher_model='some/model')
         assert mock._teacher_paths is None
         assert mock._channel_to_teacher_idx is None
+
+    # --- Per-teacher beta/temperature map tests ---
+
+    def test_teacher_beta_map_parsing(self):
+        """Valid teacher_beta_map is parsed and stored as _channel_to_beta."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        beta_map = json.dumps({'math': 0.8, 'code': 0.3})
+        mock = self._make_args(teacher_domain_map=domain_map, teacher_beta_map=beta_map)
+        assert mock._channel_to_beta == {'math': 0.8, 'code': 0.3}
+
+    def test_teacher_temperature_map_parsing(self):
+        """Valid teacher_temperature_map is parsed and stored as _channel_to_temperature."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        temp_map = json.dumps({'math': 0.7, 'code': 1.5})
+        mock = self._make_args(teacher_domain_map=domain_map, teacher_temperature_map=temp_map)
+        assert mock._channel_to_temperature == {'math': 0.7, 'code': 1.5}
+
+    def test_teacher_beta_map_partial_channels(self):
+        """Beta map can specify only a subset of channels (others use global beta)."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code', 'writing': '/path/writing'})
+        beta_map = json.dumps({'math': 0.9})  # only math, code+writing use global
+        mock = self._make_args(teacher_domain_map=domain_map, teacher_beta_map=beta_map)
+        assert mock._channel_to_beta == {'math': 0.9}
+
+    def test_invalid_beta_map_keys_raises(self):
+        """Beta map keys not in domain_map should raise ValueError."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        beta_map = json.dumps({'math': 0.5, 'nonexistent': 0.3})
+        with pytest.raises(ValueError, match='not found in teacher_domain_map'):
+            self._make_args(teacher_domain_map=domain_map, teacher_beta_map=beta_map)
+
+    def test_beta_map_without_domain_map_raises(self):
+        """teacher_beta_map without teacher_domain_map should raise ValueError."""
+        with pytest.raises(ValueError, match='requires --teacher_domain_map'):
+            self._make_args(teacher_model='some/model', teacher_beta_map=json.dumps({'math': 0.5}))
+
+    def test_beta_out_of_range_raises(self):
+        """Beta values outside [0, 1] should raise ValueError."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        with pytest.raises(ValueError, match='must be in'):
+            self._make_args(teacher_domain_map=domain_map,
+                            teacher_beta_map=json.dumps({'math': 1.5}))
+
+    def test_temperature_non_positive_raises(self):
+        """Temperature values <= 0 should raise ValueError."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        with pytest.raises(ValueError, match='must be > 0'):
+            self._make_args(teacher_domain_map=domain_map,
+                            teacher_temperature_map=json.dumps({'math': -0.5}))
 
     def test_zero3_teacher_multi_teacher_raises(self):
         """ZeRO-3 teacher + multi-teacher should raise ValueError (deadlock risk)."""
@@ -251,6 +302,126 @@ class TestGetTeacherIndices:
         stub = self._make_trainer_stub(n_teachers=3, channel_to_idx={'a': 0, 'b': 1, 'c': 2})
         result = stub._get_teacher_indices(['a', 'unknown', None, 'b', 'c', 'also_unknown'])
         assert result == [0, 0, 0, 1, 2, 0]  # unknown and None default to 0
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — grouped JSD loss (no GPU required)
+# ---------------------------------------------------------------------------
+
+class TestGroupedJsdLoss:
+    """Test _compute_grouped_jsd_loss computes per-teacher beta/temperature correctly."""
+
+    def _make_trainer_stub(self, channel_to_beta=None, channel_to_temperature=None,
+                           global_beta=0.5, global_temp=1.0):
+        """Create a minimal stub with fields needed for _compute_grouped_jsd_loss."""
+        from collections import defaultdict
+        from swift.rlhf_trainers.gkd_trainer import GKDTrainer
+
+        class _Stub:
+            beta = global_beta
+            temperature = global_temp
+
+        stub = _Stub()
+        stub.channel_to_beta = channel_to_beta
+        stub.channel_to_temperature = channel_to_temperature
+        # Bind both methods
+        stub._compute_grouped_jsd_loss = GKDTrainer._compute_grouped_jsd_loss.__get__(stub, type(stub))
+        stub.generalized_jsd_loss = GKDTrainer.generalized_jsd_loss
+        return stub
+
+    def test_uniform_params_matches_direct(self):
+        """When all channels use the same params, grouped loss matches direct computation."""
+        import torch
+        stub = self._make_trainer_stub(
+            channel_to_beta={'math': 0.5, 'code': 0.5},
+            global_beta=0.5, global_temp=1.0,
+        )
+        torch.manual_seed(42)
+        student = torch.randn(1, 20, 50)
+        teacher = torch.randn(1, 20, 50)
+        mask = torch.ones(2, 10, dtype=torch.bool)  # 2 samples, 10 tokens each
+        channels = ['math', 'code']
+
+        grouped_loss = stub._compute_grouped_jsd_loss(student, teacher, channels, mask)
+        direct_loss = stub.generalized_jsd_loss(
+            student_logits=student, teacher_logits=teacher, beta=0.5, temperature=1.0)
+
+        assert torch.allclose(grouped_loss, direct_loss, atol=1e-5), \
+            f'Grouped loss {grouped_loss.item():.6f} != direct loss {direct_loss.item():.6f}'
+
+    def test_different_betas_differ_from_uniform(self):
+        """Different per-channel betas should produce a different loss than uniform beta."""
+        import torch
+        stub_grouped = self._make_trainer_stub(
+            channel_to_beta={'math': 0.9, 'code': 0.1},
+            global_beta=0.5, global_temp=1.0,
+        )
+        stub_uniform = self._make_trainer_stub(global_beta=0.5, global_temp=1.0)
+
+        torch.manual_seed(42)
+        student = torch.randn(1, 20, 50)
+        teacher = torch.randn(1, 20, 50)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        channels = ['math', 'code']
+
+        grouped_loss = stub_grouped._compute_grouped_jsd_loss(student, teacher, channels, mask)
+        uniform_loss = stub_uniform.generalized_jsd_loss(
+            student_logits=student, teacher_logits=teacher, beta=0.5, temperature=1.0)
+
+        # They should differ because per-channel betas are asymmetric
+        assert not torch.allclose(grouped_loss, uniform_loss, atol=1e-5), \
+            'Per-channel betas should produce different loss than uniform beta'
+
+    def test_different_temperatures(self):
+        """Different per-channel temperatures should work without errors."""
+        import torch
+        stub = self._make_trainer_stub(
+            channel_to_temperature={'math': 0.5, 'code': 2.0},
+            global_temp=1.0,
+        )
+        torch.manual_seed(42)
+        student = torch.randn(1, 20, 50)
+        teacher = torch.randn(1, 20, 50)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        channels = ['math', 'code']
+
+        loss = stub._compute_grouped_jsd_loss(student, teacher, channels, mask)
+        assert not torch.isnan(loss), 'Loss should not be NaN'
+        assert not torch.isinf(loss), 'Loss should not be Inf'
+        assert loss.item() >= 0, 'JSD loss should be non-negative'
+
+    def test_fallback_to_global_for_missing_channels(self):
+        """Channels not in the map should use global beta/temperature."""
+        import torch
+        # Only 'math' has custom beta; 'code' should use global_beta=0.5
+        stub = self._make_trainer_stub(
+            channel_to_beta={'math': 0.5},
+            global_beta=0.5, global_temp=1.0,
+        )
+        torch.manual_seed(42)
+        student = torch.randn(1, 20, 50)
+        teacher = torch.randn(1, 20, 50)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        channels = ['math', 'code']
+
+        # Both effectively use beta=0.5, so should match uniform
+        grouped_loss = stub._compute_grouped_jsd_loss(student, teacher, channels, mask)
+        direct_loss = stub.generalized_jsd_loss(
+            student_logits=student, teacher_logits=teacher, beta=0.5, temperature=1.0)
+
+        assert torch.allclose(grouped_loss, direct_loss, atol=1e-5)
+
+    def test_empty_mask_returns_zero(self):
+        """All-false mask should return zero loss."""
+        import torch
+        stub = self._make_trainer_stub(channel_to_beta={'math': 0.8})
+        student = torch.randn(1, 0, 50)  # 0 valid tokens
+        teacher = torch.randn(1, 0, 50)
+        mask = torch.zeros(2, 5, dtype=torch.bool)  # all masked out
+        channels = ['math', 'code']
+
+        loss = stub._compute_grouped_jsd_loss(student, teacher, channels, mask)
+        assert loss.item() == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +599,56 @@ class TestMultiTeacherGKDIntegration:
         assert result is not None
         assert 'last_model_checkpoint' in result
 
+    def test_multi_teacher_per_teacher_beta(self):
+        """Multi-teacher GKD with different beta per teacher channel."""
+        from swift import RLHFArguments, rlhf_main
+
+        teacher_domain_map = json.dumps({
+            'math': 'Qwen/Qwen2.5-0.5B',
+            'code': 'Qwen/Qwen2.5-0.5B',
+        })
+        teacher_beta_map = json.dumps({'math': 0.8, 'code': 0.3})
+
+        result = rlhf_main(
+            RLHFArguments(
+                rlhf_type='gkd',
+                model='Qwen/Qwen2.5-0.5B',
+                teacher_domain_map=teacher_domain_map,
+                teacher_beta_map=teacher_beta_map,
+                dataset=[self.channel_jsonl],
+                split_dataset_ratio=0.0,
+                load_from_cache_file=False,
+                output_dir=os.path.join(self.tmp_dir, 'output_per_beta'),
+                **kwargs,
+            ))
+        assert result is not None
+        assert 'last_model_checkpoint' in result
+
+    def test_multi_teacher_per_teacher_temperature(self):
+        """Multi-teacher GKD with different temperature per teacher channel."""
+        from swift import RLHFArguments, rlhf_main
+
+        teacher_domain_map = json.dumps({
+            'math': 'Qwen/Qwen2.5-0.5B',
+            'code': 'Qwen/Qwen2.5-0.5B',
+        })
+        teacher_temperature_map = json.dumps({'math': 0.7, 'code': 1.5})
+
+        result = rlhf_main(
+            RLHFArguments(
+                rlhf_type='gkd',
+                model='Qwen/Qwen2.5-0.5B',
+                teacher_domain_map=teacher_domain_map,
+                teacher_temperature_map=teacher_temperature_map,
+                dataset=[self.channel_jsonl],
+                split_dataset_ratio=0.0,
+                load_from_cache_file=False,
+                output_dir=os.path.join(self.tmp_dir, 'output_per_temp'),
+                **kwargs,
+            ))
+        assert result is not None
+        assert 'last_model_checkpoint' in result
+
     def test_multi_teacher_seq_kd_per_teacher(self):
         """Multi-teacher seq_kd with per-teacher generation (not majority vote)."""
         from swift import RLHFArguments, rlhf_main
@@ -592,4 +813,5 @@ class TestMegatronMultiTeacherGuard:
 if __name__ == '__main__':
     # Run unit tests (no GPU required)
     pytest.main([__file__, '-v', '-k', 'TestTeacherDomainMapParsing or TestGetTeacherIndices'
-                 ' or TestVocabPadding or TestChannelPreservation or TestMegatronMultiTeacherGuard'])
+                 ' or TestVocabPadding or TestChannelPreservation or TestMegatronMultiTeacherGuard'
+                 ' or TestGroupedJsdLoss'])

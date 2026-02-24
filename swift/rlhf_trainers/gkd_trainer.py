@@ -60,6 +60,9 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         self.lmbda = args.lmbda
         self.temperature = args.temperature
         self.seq_kd = args.seq_kd
+        # Per-teacher hyperparameter maps (None means use global values)
+        self.channel_to_beta = getattr(args, '_channel_to_beta', None)
+        self.channel_to_temperature = getattr(args, '_channel_to_temperature', None)
         self.generation_config = model.generation_config
         self._metrics = {'train': defaultdict(list), 'eval': defaultdict(list)}
         self._total_train_tokens = 0
@@ -347,6 +350,62 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         inputs['position_ids'] = new_position_ids
         return generated_tokens, new_attention_mask, new_labels
 
+    def _compute_grouped_jsd_loss(self, flat_student_logits, flat_teacher_logits, channels, mask):
+        """Compute JSD loss with per-teacher beta and temperature.
+
+        Groups flattened masked tokens by their (beta, temperature) pair, computes JSD loss
+        per group, and returns the weighted average (weighted by token count).
+
+        Args:
+            flat_student_logits: [1, num_valid_tokens, vocab] already masked/flattened student logits
+            flat_teacher_logits: [1, num_valid_tokens, vocab] already masked/flattened teacher logits
+            channels: list of channel names per sample (length = batch_size)
+            mask: [batch, seq_len] boolean mask (used to map flat token index -> sample index)
+        """
+        global_beta = self.beta
+        global_temp = self.temperature
+
+        # Build per-token (beta, temp) by expanding sample-level channels using mask token counts
+        token_params = []
+        for i in range(mask.shape[0]):
+            n_tokens = mask[i].sum().item()
+            ch = channels[i] if channels and i < len(channels) else None
+            beta = self.channel_to_beta.get(ch, global_beta) if self.channel_to_beta and ch else global_beta
+            temp = (self.channel_to_temperature.get(ch, global_temp)
+                    if self.channel_to_temperature and ch else global_temp)
+            token_params.extend([(beta, temp)] * n_tokens)
+
+        # Group flat token indices by (beta, temp)
+        groups = defaultdict(list)
+        for tok_idx, (beta, temp) in enumerate(token_params):
+            groups[(beta, temp)].append(tok_idx)
+
+        # Squeeze batch dim: [1, N, V] -> [N, V]
+        student_logits_2d = flat_student_logits.squeeze(0)
+        teacher_logits_2d = flat_teacher_logits.squeeze(0)
+
+        total_loss = student_logits_2d.new_zeros(())
+        total_tokens = 0
+
+        for (beta, temp), indices in groups.items():
+            idx_tensor = torch.tensor(indices, device=student_logits_2d.device, dtype=torch.long)
+            group_student = student_logits_2d[idx_tensor]  # [num_tokens, vocab]
+            group_teacher = teacher_logits_2d[idx_tensor]  # [num_tokens, vocab]
+
+            group_loss = self.generalized_jsd_loss(
+                student_logits=group_student.unsqueeze(0),
+                teacher_logits=group_teacher.unsqueeze(0),
+                beta=beta,
+                temperature=temp,
+            )
+            num_tokens = len(indices)
+            total_loss = total_loss + group_loss * num_tokens
+            total_tokens += num_tokens
+
+        if total_tokens == 0:
+            return total_loss
+        return total_loss / total_tokens
+
     @patch_profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Get data source: DataSource.STUDENT, DataSource.TEACHER, or DataSource.DATASET
@@ -477,11 +536,16 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 shifted_teacher_logits[..., tea_dim:] = shifted_student_logits[..., tea_dim:]
 
             # compute loss
-            loss = self.generalized_jsd_loss(
-                student_logits=shifted_student_logits,
-                teacher_logits=shifted_teacher_logits,
-                beta=self.beta,
-            )
+            if (self.channel_to_beta or self.channel_to_temperature) and channels:
+                # Per-teacher hyperparameters: group tokens by (beta, temp) and compute loss per group
+                loss = self._compute_grouped_jsd_loss(
+                    shifted_student_logits, shifted_teacher_logits, channels, mask)
+            else:
+                loss = self.generalized_jsd_loss(
+                    student_logits=shifted_student_logits,
+                    teacher_logits=shifted_teacher_logits,
+                    beta=self.beta,
+                )
             # Add SFT loss if enabled (skip for student-generated responses)
             if self.args.sft_alpha > 0 and data_source != DataSource.STUDENT:
                 loss = loss + self.args.sft_alpha * outputs_student.loss

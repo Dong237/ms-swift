@@ -261,6 +261,25 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             'Omitted domains fall back to auto-detection. '
             f'Allowed model_type values: {list(MODEL_MAPPING.keys())}'
         })
+    # Per-teacher hyperparameters (multi-teacher GKD only)
+    teacher_beta_map: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'JSON string mapping channel names to per-teacher beta values for JSD loss. '
+            'e.g. \'{"math": 1.0, "code": 0.5}\'. '
+            'Keys must be a subset of --teacher_domain_map keys. '
+            'Omitted channels use the global --beta value.'
+        })
+    teacher_temperature_map: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'JSON string mapping channel names to per-teacher temperature values. '
+            'e.g. \'{"math": 0.7, "code": 1.0}\'. '
+            'Keys must be a subset of --teacher_domain_map keys. '
+            'Omitted channels use the global --temperature value.'
+        })
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 
@@ -661,3 +680,36 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             # Build _teacher_types aligned with _teacher_paths (None = auto-detect)
             self._teacher_types = [path_to_type.get(p) for p in self._teacher_paths]
             logger.info(f'  Teacher model types: {self._teacher_types}')
+
+        # Parse per-teacher hyperparameter maps (optional)
+        self._channel_to_beta = None
+        self._channel_to_temperature = None
+
+        for map_name, attr_name in [('teacher_beta_map', '_channel_to_beta'),
+                                     ('teacher_temperature_map', '_channel_to_temperature')]:
+            raw_value = getattr(self, map_name, None)
+            if raw_value is not None:
+                if self.teacher_domain_map is None:
+                    raise ValueError(f'--{map_name} requires --teacher_domain_map.')
+                import json
+                if isinstance(raw_value, str):
+                    raw_value = json.loads(raw_value)
+                if not isinstance(raw_value, dict):
+                    raise ValueError(f'{map_name} must be a JSON dict, got {type(raw_value)}')
+                for domain, value in raw_value.items():
+                    if domain not in self.teacher_domain_map:
+                        raise ValueError(
+                            f'{map_name} key "{domain}" not found in teacher_domain_map. '
+                            f'Valid keys: {list(self.teacher_domain_map.keys())}')
+                    if not isinstance(value, (int, float)):
+                        raise ValueError(f'{map_name}["{domain}"] must be numeric, got {type(value)}')
+                if map_name == 'teacher_beta_map':
+                    for domain, value in raw_value.items():
+                        if not (0 <= value <= 1):
+                            raise ValueError(f'teacher_beta_map["{domain}"]={value} must be in [0, 1]')
+                elif map_name == 'teacher_temperature_map':
+                    for domain, value in raw_value.items():
+                        if value <= 0:
+                            raise ValueError(f'teacher_temperature_map["{domain}"]={value} must be > 0')
+                setattr(self, attr_name, raw_value)
+                logger.info(f'  Per-teacher {map_name}: {raw_value}')
