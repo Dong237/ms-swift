@@ -199,6 +199,12 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         seq_kd (bool): Whether to use sequence-level knowledge distillation for GKD. Defaults to False.
         offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD
             training. Defaults to False.
+        teacher_domain_map (Optional[str]): JSON string mapping data channel names to teacher model paths for
+            multi-teacher GKD. Each training sample is routed to its assigned teacher based on the 'channel' field.
+            Mutually exclusive with --teacher_model. Defaults to None.
+        teacher_type_map (Optional[str]): JSON string mapping channel names to teacher model types for
+            multi-teacher GKD. Keys must be a subset of --teacher_domain_map keys. Omitted domains fall back to
+            auto-detection. Only used with --teacher_domain_map. Defaults to None.
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
             Defaults to None.
     """
@@ -235,6 +241,45 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     lmbda: float = 0.5
     seq_kd: bool = False
     offload_teacher_model: bool = False
+    # Multi-teacher GKD
+    teacher_domain_map: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'JSON string mapping data channel names to teacher model paths for multi-teacher GKD. '
+            'e.g. \'{"math": "/path/to/math_teacher", "code": "/path/to/code_teacher"}\'. '
+            'Mutually exclusive with --teacher_model (single-teacher). '
+            'Each data sample must have a "channel" field matching one of the keys.'
+        })
+    teacher_type_map: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'JSON string mapping channel names to teacher model types for multi-teacher GKD. '
+            'e.g. \'{"math": "qwen3", "code": "qwen3"}\'. '
+            'Keys must be a subset of --teacher_domain_map keys. '
+            'Omitted domains fall back to auto-detection. '
+            f'Allowed model_type values: {list(MODEL_MAPPING.keys())}'
+        })
+    # Per-teacher hyperparameters (multi-teacher GKD only)
+    teacher_beta_map: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'JSON string mapping channel names to per-teacher beta values for JSD loss. '
+            'e.g. \'{"math": 1.0, "code": 0.5}\'. '
+            'Keys must be a subset of --teacher_domain_map keys. '
+            'Omitted channels use the global --beta value.'
+        })
+    teacher_temperature_map: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'JSON string mapping channel names to per-teacher temperature values. '
+            'e.g. \'{"math": 0.7, "code": 1.0}\'. '
+            'Keys must be a subset of --teacher_domain_map keys. '
+            'Omitted channels use the global --temperature value.'
+        })
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 
@@ -554,3 +599,117 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         if self.async_generate:
             raise NotImplementedError('Currently, async_generate is not supported for GKD.')
+
+        # Multi-teacher GKD validation
+        self._teacher_paths = None
+        self._channel_to_teacher_idx = None
+
+        if self.teacher_domain_map is not None:
+            import json
+            if isinstance(self.teacher_domain_map, str):
+                self.teacher_domain_map = json.loads(self.teacher_domain_map)
+            if not isinstance(self.teacher_domain_map, dict) or not self.teacher_domain_map:
+                raise ValueError(
+                    f'teacher_domain_map must be a non-empty JSON dict, got {type(self.teacher_domain_map)}')
+            for domain, model_path in self.teacher_domain_map.items():
+                if not isinstance(domain, str) or not isinstance(model_path, str):
+                    raise ValueError(f'teacher_domain_map entries must be str→str, got {domain!r}: {model_path!r}')
+
+        if self.teacher_domain_map and self.teacher_model:
+            raise ValueError(
+                '--teacher_domain_map and --teacher_model are mutually exclusive. '
+                'Use --teacher_domain_map for multi-teacher, --teacher_model for single-teacher.')
+
+        if self.teacher_domain_map is None and self.teacher_model is None:
+            raise ValueError('GKD requires either --teacher_model (single) or --teacher_domain_map (multi).')
+
+        # Deduplicate: build unique teacher paths and channel→index mapping
+        if self.teacher_domain_map is not None:
+            unique_paths = []
+            path_to_idx = {}
+            for domain, model_path in self.teacher_domain_map.items():
+                if model_path not in path_to_idx:
+                    path_to_idx[model_path] = len(unique_paths)
+                    unique_paths.append(model_path)
+            self._teacher_paths = unique_paths
+            self._channel_to_teacher_idx = {
+                domain: path_to_idx[path]
+                for domain, path in self.teacher_domain_map.items()
+            }
+            logger.info(f'Multi-teacher GKD: {len(unique_paths)} unique teacher(s) '
+                        f'for {len(self.teacher_domain_map)} domain(s)')
+            logger.info(f'  Channel->teacher mapping: {self._channel_to_teacher_idx}')
+
+        # Validate: ZeRO-3 for teacher is incompatible with multi-teacher per-sample routing.
+        # Different ranks may have different teacher subsets in their micro-batches, causing
+        # AllGather deadlocks when ZeRO-3 tries to synchronize parameter gathering.
+        if self.teacher_domain_map is not None and self.teacher_deepspeed:
+            teacher_ds = self.teacher_deepspeed if isinstance(self.teacher_deepspeed, dict) else {}
+            teacher_stage = teacher_ds.get('zero_optimization', {}).get('stage', 0)
+            if teacher_stage == 3:
+                raise ValueError(
+                    'ZeRO-3 for teacher models is incompatible with multi-teacher per-sample routing. '
+                    'Different ranks may route to different teachers, causing AllGather deadlocks. '
+                    'Use --teacher_deepspeed zero2 or zero2_offload instead.')
+
+        # Parse teacher_type_map (optional per-teacher model type overrides)
+        self._teacher_types = None
+        if self.teacher_type_map is not None:
+            if self.teacher_domain_map is None:
+                raise ValueError('--teacher_type_map requires --teacher_domain_map.')
+            import json
+            if isinstance(self.teacher_type_map, str):
+                self.teacher_type_map = json.loads(self.teacher_type_map)
+            if not isinstance(self.teacher_type_map, dict):
+                raise ValueError(f'teacher_type_map must be a JSON dict, got {type(self.teacher_type_map)}')
+            for domain in self.teacher_type_map:
+                if domain not in self.teacher_domain_map:
+                    raise ValueError(
+                        f'teacher_type_map key "{domain}" not found in teacher_domain_map. '
+                        f'Valid keys: {list(self.teacher_domain_map.keys())}')
+            # Validate: same path must have same model_type
+            path_to_type = {}
+            for domain, model_path in self.teacher_domain_map.items():
+                mt = self.teacher_type_map.get(domain)
+                if mt is not None:
+                    if model_path in path_to_type and path_to_type[model_path] != mt:
+                        raise ValueError(
+                            f'Conflicting model types for teacher path "{model_path}": '
+                            f'"{path_to_type[model_path]}" vs "{mt}"')
+                    path_to_type[model_path] = mt
+            # Build _teacher_types aligned with _teacher_paths (None = auto-detect)
+            self._teacher_types = [path_to_type.get(p) for p in self._teacher_paths]
+            logger.info(f'  Teacher model types: {self._teacher_types}')
+
+        # Parse per-teacher hyperparameter maps (optional)
+        self._channel_to_beta = None
+        self._channel_to_temperature = None
+
+        for map_name, attr_name in [('teacher_beta_map', '_channel_to_beta'),
+                                     ('teacher_temperature_map', '_channel_to_temperature')]:
+            raw_value = getattr(self, map_name, None)
+            if raw_value is not None:
+                if self.teacher_domain_map is None:
+                    raise ValueError(f'--{map_name} requires --teacher_domain_map.')
+                import json
+                if isinstance(raw_value, str):
+                    raw_value = json.loads(raw_value)
+                if not isinstance(raw_value, dict):
+                    raise ValueError(f'{map_name} must be a JSON dict, got {type(raw_value)}')
+                for domain, value in raw_value.items():
+                    if domain not in self.teacher_domain_map:
+                        raise ValueError(
+                            f'{map_name} key "{domain}" not found in teacher_domain_map. '
+                            f'Valid keys: {list(self.teacher_domain_map.keys())}')
+                    if not isinstance(value, (int, float)):
+                        raise ValueError(f'{map_name}["{domain}"] must be numeric, got {type(value)}')
+                if map_name == 'teacher_beta_map':
+                    for domain, value in raw_value.items():
+                        if not (0 <= value <= 1):
+                            raise ValueError(f'teacher_beta_map["{domain}"]={value} must be in [0, 1]')
+                elif map_name == 'teacher_temperature_map':
+                    for domain, value in raw_value.items():
+                        if value <= 0:
+                            raise ValueError(f'teacher_temperature_map["{domain}"]={value} must be > 0')
+                setattr(self, attr_name, raw_value)
+                logger.info(f'  Per-teacher {map_name}: {raw_value}')
