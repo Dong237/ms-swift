@@ -600,6 +600,13 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         if self.async_generate:
             raise NotImplementedError('Currently, async_generate is not supported for GKD.')
 
+        # Multi-teacher GKD: reject packing/padding_free — per-sample teacher routing
+        # requires distinct batch positions per sample, which packing breaks.
+        if self.teacher_domain_map is not None and (self.padding_free or self.packing):
+            raise ValueError(
+                'Multi-teacher GKD (--teacher_domain_map) does not support --padding_free or --packing. '
+                'Per-sample teacher routing requires each batch position to correspond to exactly one sample.')
+
         # Multi-teacher GKD validation
         self._teacher_paths = None
         self._channel_to_teacher_idx = None
