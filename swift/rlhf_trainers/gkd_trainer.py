@@ -321,6 +321,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         model_inputs = {k: v for k, v in inputs.items() if k != 'labels'}
         model_inputs.pop('position_ids', None)
         model_inputs.pop('text_position_ids', None)
+        model_inputs.pop('channel', None)  # metadata field, not a model input
         kwargs = {}
         base_model = self.template.get_base_model(model)
         parameters = inspect.signature(base_model.generate).parameters
