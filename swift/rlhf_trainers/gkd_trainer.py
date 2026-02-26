@@ -175,6 +175,13 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
         Returns:
             teacher_logits: tensor [batch, seq, vocab] with per-sample teacher logits
+
+        Note on vocab mismatch handling:
+            When teachers have different vocab sizes, smaller teachers' logits are padded
+            with -1e9 (softmax ~ 0) for missing token positions. This interacts with the
+            student-teacher vocab padding in compute_loss() (which copies logits from the
+            larger model). For best results, use teachers from the same model family with
+            identical vocab sizes.
         """
         batch_size = model_inputs['input_ids'].shape[0]
         device = model_inputs['input_ids'].device
@@ -186,6 +193,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         for sample_idx, teacher_idx in enumerate(teacher_indices):
             teacher_to_samples[teacher_idx].append(sample_idx)
 
+        observed_vocab_sizes = set()
         for teacher_idx, sample_idxs in teacher_to_samples.items():
             sample_idxs_tensor = torch.tensor(sample_idxs, device=device)
 
@@ -206,6 +214,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
             subset_logits = subset_outputs.logits
             vocab_size = subset_logits.shape[-1]
+            observed_vocab_sizes.add(vocab_size)
 
             # Initialize or expand output tensor
             if teacher_logits is None:
@@ -225,6 +234,12 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
             # Scatter subset logits back into full batch
             teacher_logits[sample_idxs_tensor] = subset_logits
+
+        if len(observed_vocab_sizes) > 1:
+            logger.warning_once(
+                f'Multi-teacher vocab size mismatch detected: {observed_vocab_sizes}. '
+                f'Smaller teachers are padded with -1e9 logits. For best results, '
+                f'use teachers from the same model family with identical vocab sizes.')
 
         return teacher_logits
 
