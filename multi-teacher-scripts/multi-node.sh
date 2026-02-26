@@ -1,11 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-pip install python-dotenv # Mark 'dotenv' as satisfied
+# Install dependencies (but NOT ms-swift from PyPI — use the local repo)
 pip install python-dotenv dotenv==0.9.9 --no-deps 2>/dev/null || true
-pip install -r requirements.txt # Install main packages first (this might pull in the wrong protobuf)
-pip install 'ms-swift' msgspec transformers deepspeed vllm -U
-pip install protobuf==3.20.3 --break-system-packages
+pip install -r requirements.txt
+pip install -e .  # Install YOUR local ms-swift with multi-teacher support
+pip install msgspec transformers deepspeed vllm -U
+# Do NOT force-downgrade protobuf — vllm needs protobuf >= 5.29.6
+# The byted-wandb protobuf warnings are non-fatal.
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -16,27 +19,19 @@ pip install protobuf==3.20.3 --break-system-packages
 # NOTE: --teacher_deepspeed zero3 is NOT allowed for multi-teacher
 #       (per-sample routing causes AllGather deadlocks across ranks).
 #       Use zero2 for teacher, or omit to let teachers run without DS.
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# Merlin/Arnold environment variables are auto-detected:
-#   ARNOLD_NUM          - Number of nodes
-#   ARNOLD_WORKER_GPU   - GPUs per node
-#   ARNOLD_WORKER_0_HOST - Master node IP
-#   ARNOLD_WORKER_0_PORT - Master node port(s)
-#
-# Usage: Simply submit this script to Merlin scheduler.
-# ═══════════════════════════════════════════════════════════════════════════
 
 # ─── Multi-node detection and setup (Merlin/Arnold) ───
 nnodes=${ARNOLD_NUM:-1}
 nproc_per_node=${ARNOLD_WORKER_GPU:-8}
 export NNODES=$nnodes
+export NODE_RANK=${ARNOLD_ID:-0}
 export NPROC_PER_NODE=$nproc_per_node
 export MASTER_ADDR=${MASTER_ADDR:=$ARNOLD_WORKER_0_HOST}
 export MASTER_PORT=${MASTER_PORT:=$(echo "$ARNOLD_WORKER_0_PORT" | cut -d "," -f 1)}
 
 # ─── Environment ───
 export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python  # byted-wandb/databus compat with protobuf 6.x
 export WANDB_PROJECT="ms-swift-multi-teacher-gkd-upgrade"
 
 echo "═══════════════════════════════════════════════════════════════"
@@ -47,14 +42,14 @@ echo "════════════════════════�
 
 # ─── Models ───
 STUDENT_MODEL="/mnt/bn/youxiang-lf/models/AwemeLM6-1.7B-v4.7.0-live-lm-v1/checkpoint-45200"
-MATH_TEACHER="/mnt/bn/youxiang-lf/models/Qwen3-1.7B"
-ANCHOR_MEMORY_TEACHER="/mnt/bn/youxiang-lf/models/Livelm-1.7B-v1-gkd-anchor-memory-gkdistilled-teacher-8B-200700-beta0.9lr1e_5-checkpoint-45200/checkpoint-3105"
+CODE_TEACHER="/mnt/bn/youxiang-lf/models/Qwen3-8B"
+ANCHOR_MEMORY_TEACHER="/mnt/bn/youxiang-lf/models/qwen3_8b_instruct-anchor-memory-teacher-200700/checkpoint-3136"
 
 CUSTOM_DATASET_INFO="/mnt/bn/youxiang-lf/data/dataset_info_ms_swift.json"
 
 # NOTE: single-line valid JSON, no trailing commas
-TEACHER_DOMAIN_MAP="{\"math\":\"${MATH_TEACHER}\",\"anchor_memory\":\"${ANCHOR_MEMORY_TEACHER}\"}"
-TEACHER_TYPE_MAP='{"math":"qwen3","anchor_memory":"qwen3"}'
+TEACHER_DOMAIN_MAP="{\"code\":\"${CODE_TEACHER}\",\"anchor_memory\":\"${ANCHOR_MEMORY_TEACHER}\"}"
+TEACHER_TYPE_MAP='{"code":"qwen3","anchor_memory":"qwen3"}'
 
 # ─── Per-teacher hyperparameters (optional) ───
 # Uncomment to set per-channel beta/temperature for JSD loss.
@@ -62,7 +57,7 @@ TEACHER_TYPE_MAP='{"math":"qwen3","anchor_memory":"qwen3"}'
 # TEACHER_BETA_MAP='{"math": 0.9, "anchor_memory": 0.5}'
 # TEACHER_TEMPERATURE_MAP='{"math": 0.7, "anchor_memory": 1.0}'
 
-run_name="Qwen3-1.7B-multi-teacher-gkd-2teachers-multinode"
+run_name="Qwen3-1.7B-multi-teacher-gkd-code-8B-anchor-8b-200700"
 OUTPUT_DIR="/mnt/bn/youxiang-lf/models/$run_name"
 export WANDB_NAME="$run_name"
 
@@ -94,7 +89,7 @@ swift rlhf \
     --teacher_type_map "$TEACHER_TYPE_MAP" \
     --train_type full \
     --custom_dataset_info "$CUSTOM_DATASET_INFO" \
-    --dataset anchor_memory_policy_sft200700_sample_multi_teacher_test-ms-swift competition_math_multi_teacher_test \
+    --dataset anchor_memory_policy_sft200700_sample_multi_teacher_test-ms-swift code_master_gkd_10w_livecodebench\
     --split_dataset_ratio 0.01 \
     --seq_kd false \
     --lmbda 1 \
@@ -106,7 +101,7 @@ swift rlhf \
     --learning_rate 1e-5 \
     --gradient_accumulation_steps 4 \
     --eval_steps 10 \
-    --save_steps 50 \
+    --save_steps 781 \
     --save_total_limit 5 \
     --logging_steps 5 \
     --max_length 4096 \
@@ -116,7 +111,7 @@ swift rlhf \
     --save_only_model true \
     --dataloader_num_workers 8 \
     --dataset_num_proc 8 \
-    --deepspeed zero3 \
+    --deepspeed zero2 \
     --attn_impl sdpa \
     --teacher_deepspeed zero2 \
     --offload_teacher_model true \
