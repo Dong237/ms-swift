@@ -586,10 +586,12 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                     data['messages'] = replace_assistant_response_with_ids(data['messages'], data['response_token_ids'])
 
                 if encode_prompt_only:
-                    # Remove response content for prompt-only encoding
+                    # Remove response content for prompt-only encoding.
+                    # Create a shallow copy to avoid mutating the original data dict
+                    # (which would corrupt responses for multi-epoch training).
                     messages = data.get('messages', [])
                     if messages and messages[-1].get('role') == 'assistant':
-                        messages[-1]['content'] = None
+                        data = {**data, 'messages': [*messages[:-1], {**messages[-1], 'content': None}]}
 
                 encoded = template.encode(data, return_length=True)
                 batch_encoded_inputs.append(encoded)
