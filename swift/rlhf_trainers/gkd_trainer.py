@@ -427,7 +427,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         has_per_teacher_params = (self.channel_to_beta or self.channel_to_temperature) and channels
         if self.use_liger_gkd_loss and not use_multi_teacher and not has_per_teacher_params:
             # Liger fused JSD loss for memory efficiency (single teacher only)
-            teacher_idx = 0 if teacher_indices is None else teacher_indices[0]
+            teacher_idx = 0 if not teacher_indices else teacher_indices[0]
             teacher_model_selected = self.teacher_models[teacher_idx]
             is_ds3_selected = self.is_teacher_ds3_list[teacher_idx] if teacher_idx < len(
                 self.is_teacher_ds3_list) else None
