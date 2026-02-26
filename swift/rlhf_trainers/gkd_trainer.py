@@ -550,6 +550,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                     student_logits=shifted_student_logits,
                     teacher_logits=shifted_teacher_logits,
                     beta=self.beta,
+                    temperature=self.temperature,
                 )
             # Add SFT loss if enabled (skip for student-generated responses)
             if self.args.sft_alpha > 0 and data_source != DataSource.STUDENT:
