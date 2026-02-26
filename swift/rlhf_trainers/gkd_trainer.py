@@ -370,9 +370,9 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         for i in range(mask.shape[0]):
             n_tokens = mask[i].sum().item()
             ch = channels[i] if channels and i < len(channels) else None
-            beta = self.channel_to_beta.get(ch, global_beta) if self.channel_to_beta and ch else global_beta
+            beta = self.channel_to_beta.get(ch, global_beta) if self.channel_to_beta and ch is not None else global_beta
             temp = (self.channel_to_temperature.get(ch, global_temp)
-                    if self.channel_to_temperature and ch else global_temp)
+                    if self.channel_to_temperature and ch is not None else global_temp)
             token_params.extend([(beta, temp)] * n_tokens)
 
         # Group flat token indices by (beta, temp)
