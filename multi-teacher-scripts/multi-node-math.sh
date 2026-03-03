@@ -6,8 +6,8 @@ pip install python-dotenv dotenv==0.9.9 --no-deps 2>/dev/null || true
 pip install -r requirements.txt
 pip install -e .  # Install YOUR local ms-swift with multi-teacher support
 pip install msgspec transformers deepspeed vllm -U
-# Do NOT force-downgrade protobuf — vllm needs protobuf >= 5.29.6
-# The byted-wandb protobuf warnings are non-fatal.
+pip install protobuf==3.20.3 --break-system-packages
+# Do NOT force-downgrade protobuf — let pip resolve it
 
 
 
@@ -31,7 +31,6 @@ export MASTER_PORT=${MASTER_PORT:=$(echo "$ARNOLD_WORKER_0_PORT" | cut -d "," -f
 
 # ─── Environment ───
 export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'
-export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python  # byted-wandb/databus compat with protobuf 6.x
 export WANDB_PROJECT="ms-swift-multi-teacher-gkd-upgrade"
 
 echo "═══════════════════════════════════════════════════════════════"
@@ -42,14 +41,14 @@ echo "════════════════════════�
 
 # ─── Models ───
 STUDENT_MODEL="/mnt/bn/youxiang-lf/models/AwemeLM6-1.7B-v4.7.0-live-lm-v1/checkpoint-45200"
-CODE_TEACHER="/mnt/bn/youxiang-lf/models/Qwen3-8B"
+MATH_TEACHER="/mnt/bn/youxiang-lf/models/Qwen3-8B"
 ANCHOR_MEMORY_TEACHER="/mnt/bn/youxiang-lf/models/qwen3_8b_instruct-anchor-memory-teacher-200700/checkpoint-3136"
 
 CUSTOM_DATASET_INFO="/mnt/bn/youxiang-lf/data/dataset_info_ms_swift.json"
 
 # NOTE: single-line valid JSON, no trailing commas
-TEACHER_DOMAIN_MAP="{\"code\":\"${CODE_TEACHER}\",\"anchor_memory\":\"${ANCHOR_MEMORY_TEACHER}\"}"
-TEACHER_TYPE_MAP='{"code":"qwen3","anchor_memory":"qwen3"}'
+TEACHER_DOMAIN_MAP="{\"math\":\"${MATH_TEACHER}\",\"anchor_memory\":\"${ANCHOR_MEMORY_TEACHER}\"}"
+TEACHER_TYPE_MAP='{"math":"qwen3","anchor_memory":"qwen3"}'
 
 # ─── Per-teacher hyperparameters (optional) ───
 # Uncomment to set per-channel beta/temperature for JSD loss.
@@ -57,7 +56,7 @@ TEACHER_TYPE_MAP='{"code":"qwen3","anchor_memory":"qwen3"}'
 # TEACHER_BETA_MAP='{"math": 0.9, "anchor_memory": 0.5}'
 # TEACHER_TEMPERATURE_MAP='{"math": 0.7, "anchor_memory": 1.0}'
 
-run_name="Qwen3-1.7B-multi-teacher-gkd-code-8B-anchor-8b-200700"
+run_name="Qwen3-1.7B-multi-teacher-gkd-math-8B-anchor-8b-200700"
 OUTPUT_DIR="/mnt/bn/youxiang-lf/models/$run_name"
 export WANDB_NAME="$run_name"
 
@@ -89,19 +88,19 @@ swift rlhf \
     --teacher_type_map "$TEACHER_TYPE_MAP" \
     --train_type full \
     --custom_dataset_info "$CUSTOM_DATASET_INFO" \
-    --dataset anchor_memory_policy_sft200700_sample_multi_teacher_test-ms-swift code_master_gkd_10w_livecodebench\
+    --dataset anchor_memory_policy_sft200700-ms-swift competition_math_multi_teacher_test\
     --split_dataset_ratio 0.01 \
     --seq_kd false \
     --lmbda 1 \
     --beta 0.9 \
     --torch_dtype bfloat16 \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 2 \
     --learning_rate 1e-5 \
     --gradient_accumulation_steps 4 \
-    --eval_steps 10 \
-    --save_steps 781 \
+    --eval_steps 5 \
+    --save_steps 50 \
     --save_total_limit 5 \
     --logging_steps 5 \
     --max_length 4096 \
