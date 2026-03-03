@@ -748,10 +748,18 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
                 setattr(self, attr_name, raw_value)
                 logger.info(f'  Per-teacher {map_name}: {raw_value}')
 
-        # Interleave=True with multi-teacher: disable dataset shuffle for homogeneous batches
+        # Interleave=True with multi-teacher: disable ALL shuffle sources for homogeneous batches.
+        # Both dataset_shuffle (pre-DataLoader concat) and train_dataloader_shuffle (sampler)
+        # must be False, otherwise the DataLoader sampler re-shuffles even an ordered dataset.
         if self.teacher_domain_map is not None and getattr(self, 'interleave', True):
+            changed = []
             if getattr(self, 'dataset_shuffle', True):
-                logger.info(
-                    'Multi-teacher GKD with --interleave true: disabling dataset_shuffle '
-                    'to produce homogeneous batches. Use --interleave false to restore shuffling.')
                 self.dataset_shuffle = False
+                changed.append('dataset_shuffle')
+            if getattr(self, 'train_dataloader_shuffle', True):
+                self.train_dataloader_shuffle = False
+                changed.append('train_dataloader_shuffle')
+            if changed:
+                logger.info(
+                    f'Multi-teacher GKD with --interleave true: disabled {", ".join(changed)} '
+                    f'to produce homogeneous batches. Use --interleave false to restore shuffling.')

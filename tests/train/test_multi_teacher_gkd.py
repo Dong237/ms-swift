@@ -962,7 +962,10 @@ class TestRoutingLog:
 
         if log_domain_routing and channels and is_main_process:
             routing_counts = Counter(channels)
-            routing_str = ', '.join(f'{ch}={cnt}' for ch, cnt in sorted(routing_counts.items()))
+            # Fixed sort: explicit key so None (no channel) sorts last without TypeError
+            routing_str = ', '.join(
+                f'{ch}={cnt}' for ch, cnt in
+                sorted(routing_counts.items(), key=lambda x: (x[0] is None, x[0] or '')))
             print(f'[Step {global_step}] Routing: {routing_str}', flush=True)
 
         captured = capsys.readouterr()
@@ -994,6 +997,35 @@ class TestRoutingLog:
         # anchor should appear before code before math
         assert out.index('anchor') < out.index('code') < out.index('math')
 
+    def test_routing_log_mixed_none_and_string_no_crash(self, capsys):
+        """Routing log with mixed None+str channels must NOT raise TypeError (P1-1 regression).
+
+        base.py:1752 sets res['channel'] = [b.get('channel') for b in batch] when
+        any(channel) is True. Mixed None+str lists are therefore possible. Python 3
+        cannot sort None vs str without an explicit key — this test guards the fix.
+        """
+        from collections import Counter
+        channels = ['math', None, 'code', None, 'math']
+        routing_counts = Counter(channels)
+        # Must not raise TypeError
+        routing_str = ', '.join(
+            f'{ch}={cnt}' for ch, cnt in
+            sorted(routing_counts.items(), key=lambda x: (x[0] is None, x[0] or '')))
+        assert 'math=2' in routing_str
+        assert 'code=1' in routing_str
+        # None entries appear last (tuple comparison: True > False)
+        assert routing_str.rindex('None=') > routing_str.index('code=')
+
+    def test_routing_log_all_none_channels_no_crash(self, capsys):
+        """All-None channels list: routing log should handle gracefully."""
+        from collections import Counter
+        channels = [None, None, None]
+        routing_counts = Counter(channels)
+        routing_str = ', '.join(
+            f'{ch}={cnt}' for ch, cnt in
+            sorted(routing_counts.items(), key=lambda x: (x[0] is None, x[0] or '')))
+        assert 'None=3' in routing_str
+
 
 # ---------------------------------------------------------------------------
 # Unit tests — interleave arg (no GPU required)
@@ -1021,6 +1053,7 @@ class TestInterleaveArg:
             padding_free = False
             packing = False
             dataset_shuffle = True
+            train_dataloader_shuffle = True  # separate DataLoader sampler shuffle (P1-2)
             interleave = True  # new default
 
         mock = _MockArgs()
@@ -1035,22 +1068,49 @@ class TestInterleaveArg:
         mock = self._make_args(teacher_domain_map=domain_map, interleave=True, dataset_shuffle=True)
         assert mock.dataset_shuffle is False
 
+    def test_interleave_true_disables_dataloader_shuffle(self):
+        """interleave=True also disables train_dataloader_shuffle (P1-2 regression test).
+
+        dataset_shuffle=False only controls dataset-level ordering. The DataLoader
+        sampler uses train_dataloader_shuffle (mixin.py:1254), which must also be
+        disabled, otherwise ordered batches are re-shuffled by the sampler.
+        """
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        mock = self._make_args(
+            teacher_domain_map=domain_map, interleave=True,
+            dataset_shuffle=True, train_dataloader_shuffle=True)
+        assert mock.dataset_shuffle is False
+        assert mock.train_dataloader_shuffle is False
+
     def test_interleave_false_keeps_shuffle(self):
         """interleave=False + teacher_domain_map → dataset_shuffle stays True."""
         domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
         mock = self._make_args(teacher_domain_map=domain_map, interleave=False, dataset_shuffle=True)
         assert mock.dataset_shuffle is True
 
+    def test_interleave_false_keeps_dataloader_shuffle(self):
+        """interleave=False → train_dataloader_shuffle stays True."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        mock = self._make_args(
+            teacher_domain_map=domain_map, interleave=False, train_dataloader_shuffle=True)
+        assert mock.train_dataloader_shuffle is True
+
     def test_interleave_no_effect_without_domain_map(self):
-        """interleave=True without teacher_domain_map → dataset_shuffle unchanged."""
-        mock = self._make_args(teacher_model='some/model', interleave=True, dataset_shuffle=True)
+        """interleave=True without teacher_domain_map → shuffle fields unchanged."""
+        mock = self._make_args(
+            teacher_model='some/model', interleave=True,
+            dataset_shuffle=True, train_dataloader_shuffle=True)
         assert mock.dataset_shuffle is True
+        assert mock.train_dataloader_shuffle is True
 
     def test_interleave_already_false_no_change(self):
-        """interleave=True but dataset_shuffle already False → stays False."""
+        """interleave=True but both shuffles already False → stays False."""
         domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
-        mock = self._make_args(teacher_domain_map=domain_map, interleave=True, dataset_shuffle=False)
+        mock = self._make_args(
+            teacher_domain_map=domain_map, interleave=True,
+            dataset_shuffle=False, train_dataloader_shuffle=False)
         assert mock.dataset_shuffle is False
+        assert mock.train_dataloader_shuffle is False
 
 
 # ---------------------------------------------------------------------------

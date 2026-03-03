@@ -462,8 +462,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         # Single channel in batch: fall back to standard loss (no domain weighting needed)
         if len(unique_channels) <= 1:
             ch = unique_channels[0] if unique_channels else None
-            beta = self.channel_to_beta.get(ch, global_beta) if self.channel_to_beta and ch else global_beta
-            temp = self.channel_to_temperature.get(ch, global_temp) if self.channel_to_temperature and ch else global_temp
+            beta = self.channel_to_beta.get(ch, global_beta) if self.channel_to_beta and ch is not None else global_beta
+            temp = self.channel_to_temperature.get(ch, global_temp) if self.channel_to_temperature and ch is not None else global_temp
             loss = self.generalized_jsd_loss(
                 student_logits=flat_student_logits,
                 teacher_logits=flat_teacher_logits,
@@ -483,8 +483,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             idx_tensor = torch.tensor(indices, device=student_logits_2d.device, dtype=torch.long)
             group_student = student_logits_2d[idx_tensor]
             group_teacher = teacher_logits_2d[idx_tensor]
-            beta = self.channel_to_beta.get(ch, global_beta) if self.channel_to_beta and ch else global_beta
-            temp = self.channel_to_temperature.get(ch, global_temp) if self.channel_to_temperature and ch else global_temp
+            beta = self.channel_to_beta.get(ch, global_beta) if self.channel_to_beta and ch is not None else global_beta
+            temp = self.channel_to_temperature.get(ch, global_temp) if self.channel_to_temperature and ch is not None else global_temp
             domain_loss = self.generalized_jsd_loss(
                 student_logits=group_student.unsqueeze(0),
                 teacher_logits=group_teacher.unsqueeze(0),
@@ -519,7 +519,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         if self.log_domain_routing and channels and self.accelerator.is_main_process:
             from collections import Counter
             routing_counts = Counter(channels)
-            routing_str = ', '.join(f'{ch}={cnt}' for ch, cnt in sorted(routing_counts.items()))
+            # Use explicit sort key: None sorts last, strings sort alphabetically
+            routing_str = ', '.join(
+                f'{ch}={cnt}' for ch, cnt in
+                sorted(routing_counts.items(), key=lambda x: (x[0] is None, x[0] or '')))
             print(f'[Step {self.state.global_step}] Routing: {routing_str}', flush=True)
 
         has_per_teacher_params = (self.channel_to_beta or self.channel_to_temperature) and channels
