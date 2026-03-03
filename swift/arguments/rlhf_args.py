@@ -303,8 +303,9 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         metadata={
             'help':
             'When True (default) and using multi-teacher GKD, disables dataset shuffling so '
-            'datasets are concatenated in domain order, producing homogeneous batches where '
-            'all samples in a batch come from the same teacher domain. '
+            'datasets are concatenated in domain order, producing more ordered batches where '
+            'most samples in a batch come from the same teacher domain. '
+            'Note: DDP strided sampling may still mix domains at shard boundaries. '
             'Set to False to use the original shuffle behavior (mixed-domain batches).'
         })
     # compat
@@ -748,9 +749,10 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
                 setattr(self, attr_name, raw_value)
                 logger.info(f'  Per-teacher {map_name}: {raw_value}')
 
-        # Interleave=True with multi-teacher: disable ALL shuffle sources for homogeneous batches.
+        # Interleave=True with multi-teacher: disable ALL shuffle sources for more ordered batches.
         # Both dataset_shuffle (pre-DataLoader concat) and train_dataloader_shuffle (sampler)
         # must be False, otherwise the DataLoader sampler re-shuffles even an ordered dataset.
+        # Note: DDP strided sampling may still mix domains at shard boundaries.
         if self.teacher_domain_map is not None and getattr(self, 'interleave', True):
             changed = []
             if getattr(self, 'dataset_shuffle', True):
@@ -762,4 +764,5 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             if changed:
                 logger.info(
                     f'Multi-teacher GKD with --interleave true: disabled {", ".join(changed)} '
-                    f'to produce homogeneous batches. Use --interleave false to restore shuffling.')
+                    f'for more ordered batches (DDP shard boundaries may still mix domains). '
+                    f'Use --interleave false to restore shuffling.')

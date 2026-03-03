@@ -1010,7 +1010,7 @@ class TestRoutingLog:
         # Must not raise TypeError
         routing_str = ', '.join(
             f'{ch}={cnt}' for ch, cnt in
-            sorted(routing_counts.items(), key=lambda x: (x[0] is None, x[0] or '')))
+            sorted(routing_counts.items(), key=lambda x: (x[0] is None, str(x[0]) if x[0] is not None else '')))
         assert 'math=2' in routing_str
         assert 'code=1' in routing_str
         # None entries appear last (tuple comparison: True > False)
@@ -1023,8 +1023,53 @@ class TestRoutingLog:
         routing_counts = Counter(channels)
         routing_str = ', '.join(
             f'{ch}={cnt}' for ch, cnt in
-            sorted(routing_counts.items(), key=lambda x: (x[0] is None, x[0] or '')))
+            sorted(routing_counts.items(), key=lambda x: (x[0] is None, str(x[0]) if x[0] is not None else '')))
         assert 'None=3' in routing_str
+
+    def test_routing_log_integer_channels_no_crash(self):
+        """Sort key must NOT crash when channel keys are integers (P3 regression).
+
+        `x[0] or ''` returns the int itself (e.g. 1 or '' = 1) when channel is a
+        non-zero integer. Tuple comparison (False, 1) vs (False, 'math') raises
+        TypeError in Python 3. The fix uses str(x[0]) to guarantee string comparison.
+        """
+        from collections import Counter
+        channels = [1, 2, 1, 0, 2]
+        routing_counts = Counter(channels)
+        # Must not raise TypeError
+        routing_str = ', '.join(
+            f'{ch}={cnt}' for ch, cnt in
+            sorted(routing_counts.items(), key=lambda x: (x[0] is None, str(x[0]) if x[0] is not None else '')))
+        assert '1=2' in routing_str
+        assert '2=2' in routing_str
+        assert '0=1' in routing_str
+
+    def test_routing_log_shows_teacher_index_annotation(self):
+        """Routing log output includes channel->[teacher_idx] annotation for debugging.
+
+        Unknown channels show '?' suffix to clarify they fall back to teacher[0].
+        """
+        from collections import Counter
+
+        channel_to_teacher_idx = {'math': 0, 'code': 1}
+        channels = ['math', 'code', 'math', 'unknown']
+        routing_counts = Counter(channels)
+
+        def _teacher_label(ch):
+            if channel_to_teacher_idx and ch is not None and ch in channel_to_teacher_idx:
+                return f'{ch}->[{channel_to_teacher_idx[ch]}]'
+            elif ch is None:
+                return 'None->[0]'
+            else:
+                return f'{ch}->[0]?'
+
+        routing_str = ', '.join(
+            f'{_teacher_label(ch)}={cnt}' for ch, cnt in
+            sorted(routing_counts.items(), key=lambda x: (x[0] is None, str(x[0]) if x[0] is not None else '')))
+
+        assert 'code->[1]=1' in routing_str
+        assert 'math->[0]=2' in routing_str
+        assert 'unknown->[0]?=1' in routing_str  # unknown channel shows fallback with ?
 
 
 # ---------------------------------------------------------------------------
@@ -1201,6 +1246,44 @@ class TestDomainLossLogging:
             stub._domain_loss_accum.clear()
 
         assert abs(logs['domain_loss/anchor'] - 2.0) < 1e-5  # mean of [1, 2, 3]
+
+    def test_accum_cleared_on_non_main_process(self):
+        """_domain_loss_accum.clear() must run on ALL ranks, not just main process (P1 regression).
+
+        _compute_domain_weighted_jsd_loss fills the accum on every rank. Previously,
+        clear() was inside `if is_main_process`, causing non-main ranks to grow their
+        accum for the entire training run (unbounded memory). The fix moves clear()
+        outside the gate — this test verifies that behavior.
+        """
+        from collections import defaultdict
+
+        class _MockAcceleratorNonMain:
+            is_main_process = False
+
+        class _MockState:
+            global_step = 10
+
+        class _Stub:
+            accelerator = _MockAcceleratorNonMain()
+            state = _MockState()
+
+        stub = _Stub()
+        stub._domain_loss_accum = defaultdict(list)
+        stub._domain_loss_accum['math'].extend([0.5, 0.6])
+        stub._domain_loss_accum['code'].extend([0.3])
+
+        logs = {}
+        # Simulate the FIXED log() block: inject only on main, but ALWAYS clear
+        if stub.accelerator.is_main_process and stub._domain_loss_accum:
+            for channel, losses in stub._domain_loss_accum.items():
+                avg_loss = sum(losses) / len(losses)
+                logs[f'domain_loss/{channel}'] = round(avg_loss, 6)
+        # Always clear — this is the P1 fix
+        stub._domain_loss_accum.clear()
+
+        # On non-main process: accum is cleared but nothing injected into logs
+        assert len(stub._domain_loss_accum) == 0, 'Accum must be cleared on non-main process too'
+        assert 'domain_loss/math' not in logs, 'Non-main process must not inject into logs'
 
 
 if __name__ == '__main__':

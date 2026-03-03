@@ -515,14 +515,23 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         teacher_indices = self._get_teacher_indices(channels)
         use_multi_teacher = teacher_indices is not None and len(set(teacher_indices)) > 1
 
-        # Log per-batch routing distribution to stdout (rank 0, gated by log_domain_routing)
+        # Log per-batch routing distribution to stdout (rank 0, gated by log_domain_routing).
+        # Each entry shows: channel->teacher_idx=count (unknown channels show ->0 to clarify fallback).
         if self.log_domain_routing and channels and self.accelerator.is_main_process:
             from collections import Counter
             routing_counts = Counter(channels)
-            # Use explicit sort key: None sorts last, strings sort alphabetically
+            # Use explicit sort key: None sorts last, all other keys coerced to str for safe comparison
+            def _teacher_label(ch):
+                if self.channel_to_teacher_idx and ch is not None and ch in self.channel_to_teacher_idx:
+                    return f'{ch}->[{self.channel_to_teacher_idx[ch]}]'
+                elif ch is None:
+                    return 'None->[0]'
+                else:
+                    return f'{ch}->[0]?'  # unknown channel falls back to teacher[0]
+
             routing_str = ', '.join(
-                f'{ch}={cnt}' for ch, cnt in
-                sorted(routing_counts.items(), key=lambda x: (x[0] is None, x[0] or '')))
+                f'{_teacher_label(ch)}={cnt}' for ch, cnt in
+                sorted(routing_counts.items(), key=lambda x: (x[0] is None, str(x[0]) if x[0] is not None else '')))
             print(f'[Step {self.state.global_step}] Routing: {routing_str}', flush=True)
 
         has_per_teacher_params = (self.channel_to_beta or self.channel_to_temperature) and channels
@@ -976,7 +985,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         """Override log method to include completion table logging (aligned with GRPO)."""
         import sys
-        # Inject per-domain losses into logs before calling super (so WandB gets them)
+        # Inject per-domain losses into logs before calling super (so WandB gets them).
+        # Only main process logs/reports; ALL ranks clear to prevent unbounded memory growth.
         if self.accelerator.is_main_process and self._domain_loss_accum:
             for channel, losses in self._domain_loss_accum.items():
                 avg_loss = sum(losses) / len(losses)
@@ -985,7 +995,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                     f'[Step {self.state.global_step}] domain_loss/{channel} = {avg_loss:.4f}',
                     file=sys.stderr,
                     flush=True)
-            self._domain_loss_accum.clear()
+        # Always clear on every rank — accum is filled on all ranks in _compute_domain_weighted_jsd_loss
+        self._domain_loss_accum.clear()
 
         # Call parent log method
         import transformers
