@@ -112,6 +112,10 @@ if [ -n "${TEACHER_TEMPERATURE_MAP:-}" ]; then
 fi
 
 # ─── Launch Training ───
+# v2 new args:
+#   --interleave true              concat datasets in domain order; avoids ~96% mixed-domain batches caused by shuffle
+#   --enable_weighted_domain_loss  mean of per-domain token-averaged losses; prevents high-KL domain (code) from drowning anchor signal
+#   --log_domain_routing true      print "Routing: code->[1]=4, anchor_memory->[0]=4" to stdout every step
 swift rlhf \
     --rlhf_type gkd \
     --model "$STUDENT_MODEL" \
