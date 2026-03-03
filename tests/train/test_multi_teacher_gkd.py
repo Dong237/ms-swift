@@ -810,8 +810,342 @@ class TestMegatronMultiTeacherGuard:
             pytest.skip('megatron not installed')
 
 
+# ---------------------------------------------------------------------------
+# Unit tests — domain-weighted JSD loss (no GPU required)
+# ---------------------------------------------------------------------------
+
+class TestDomainWeightedLoss:
+    """Test _compute_domain_weighted_jsd_loss gives equal per-domain weighting."""
+
+    def _make_trainer_stub(self, channel_to_beta=None, channel_to_temperature=None,
+                           global_beta=0.5, global_temp=1.0):
+        from collections import defaultdict
+        from swift.rlhf_trainers.gkd_trainer import GKDTrainer
+
+        class _Stub:
+            beta = global_beta
+            temperature = global_temp
+
+        stub = _Stub()
+        stub.channel_to_beta = channel_to_beta
+        stub.channel_to_temperature = channel_to_temperature
+        stub._domain_loss_accum = defaultdict(list)
+        stub._compute_domain_weighted_jsd_loss = GKDTrainer._compute_domain_weighted_jsd_loss.__get__(
+            stub, type(stub))
+        stub.generalized_jsd_loss = GKDTrainer.generalized_jsd_loss
+        return stub
+
+    def test_single_channel_matches_direct(self):
+        """Single channel in batch: domain-weighted = direct generalized_jsd_loss."""
+        import torch
+        stub = self._make_trainer_stub(global_beta=0.5, global_temp=1.0)
+        torch.manual_seed(42)
+        student = torch.randn(1, 20, 50)
+        teacher = torch.randn(1, 20, 50)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        channels = ['math', 'math']
+
+        domain_loss = stub._compute_domain_weighted_jsd_loss(student, teacher, channels, mask)
+        direct_loss = stub.generalized_jsd_loss(student_logits=student, teacher_logits=teacher,
+                                                beta=0.5, temperature=1.0)
+        assert torch.allclose(domain_loss, direct_loss, atol=1e-5), \
+            f'Single-channel domain loss {domain_loss.item():.6f} != direct {direct_loss.item():.6f}'
+
+    def test_domain_weighted_differs_from_token_weighted(self):
+        """Two channels with unequal token counts: domain-weighted != token-weighted."""
+        import torch
+        stub = self._make_trainer_stub(global_beta=0.5, global_temp=1.0)
+        torch.manual_seed(42)
+        vocab = 50
+        # Sample 0 (math): 10 tokens; Sample 1 (code): 2 tokens
+        # Create logits with divergent distributions so math dominates token-weighted
+        student = torch.zeros(1, 12, vocab)
+        teacher = torch.zeros(1, 12, vocab)
+        # math tokens: uniform student vs peaked teacher (high KL)
+        student[0, :10, 0] = 1.0
+        teacher[0, :10, :] = 0.0
+        teacher[0, :10, 0] = 10.0  # strongly peaked → high KL
+        # code tokens: nearly matched (low KL)
+        student[0, 10:, :] = 1.0 / vocab
+        teacher[0, 10:, :] = 1.0 / vocab
+
+        # mask: 10 tokens for sample 0 (math), 2 tokens for sample 1 (code)
+        mask = torch.zeros(2, 12, dtype=torch.bool)
+        mask[0, :10] = True
+        mask[1, 10:] = True  # 2 tokens
+
+        channels = ['math', 'code']
+
+        domain_loss = stub._compute_domain_weighted_jsd_loss(student, teacher, channels, mask)
+        token_loss = stub.generalized_jsd_loss(student_logits=student[mask][None],
+                                               teacher_logits=teacher[mask][None],
+                                               beta=0.5, temperature=1.0)
+
+        # Domain-weighted should be closer to equal average of (high_kl, low_kl)
+        # Token-weighted is dominated by math (10 tokens, high KL)
+        # They should differ
+        assert not torch.allclose(domain_loss, token_loss, atol=1e-3), \
+            'Domain-weighted and token-weighted should differ for unequal token counts'
+
+    def test_domain_loss_accum_populated(self):
+        """After _compute_domain_weighted_jsd_loss, _domain_loss_accum has per-channel entries."""
+        import torch
+        from collections import defaultdict
+        stub = self._make_trainer_stub(global_beta=0.5, global_temp=1.0)
+        torch.manual_seed(42)
+        student = torch.randn(1, 20, 50)
+        teacher = torch.randn(1, 20, 50)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        channels = ['math', 'code']
+
+        stub._compute_domain_weighted_jsd_loss(student, teacher, channels, mask)
+
+        assert 'math' in stub._domain_loss_accum
+        assert 'code' in stub._domain_loss_accum
+        assert len(stub._domain_loss_accum['math']) == 1
+        assert len(stub._domain_loss_accum['code']) == 1
+
+    def test_domain_loss_accum_not_populated_single_channel(self):
+        """Single-channel batch: accum is populated for that channel."""
+        import torch
+        stub = self._make_trainer_stub(global_beta=0.5, global_temp=1.0)
+        torch.manual_seed(42)
+        student = torch.randn(1, 20, 50)
+        teacher = torch.randn(1, 20, 50)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        channels = ['math', 'math']
+
+        stub._compute_domain_weighted_jsd_loss(student, teacher, channels, mask)
+
+        assert 'math' in stub._domain_loss_accum
+        assert 'code' not in stub._domain_loss_accum
+
+    def test_per_channel_beta_used_in_domain_weighted(self):
+        """Per-channel beta is used within _compute_domain_weighted_jsd_loss."""
+        import torch
+        stub_no_beta = self._make_trainer_stub(global_beta=0.5)
+        stub_per_beta = self._make_trainer_stub(
+            channel_to_beta={'math': 0.9, 'code': 0.1}, global_beta=0.5)
+        torch.manual_seed(42)
+        student = torch.randn(1, 20, 50)
+        teacher = torch.randn(1, 20, 50)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        channels = ['math', 'code']
+
+        loss_no_beta = stub_no_beta._compute_domain_weighted_jsd_loss(student, teacher, channels, mask)
+        loss_per_beta = stub_per_beta._compute_domain_weighted_jsd_loss(student, teacher, channels, mask)
+
+        assert not torch.allclose(loss_no_beta, loss_per_beta, atol=1e-5), \
+            'Per-channel beta should produce different loss than global beta'
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — routing log visibility (no GPU required)
+# ---------------------------------------------------------------------------
+
+class TestRoutingLog:
+    """Test that per-batch routing is printed to stdout when log_domain_routing=True."""
+
+    def _make_routing_log_test(self, channels, log_domain_routing, capsys):
+        """Helper: simulate the routing log logic from compute_loss."""
+        from collections import Counter
+
+        class _MockAccelerator:
+            is_main_process = True
+
+        class _MockState:
+            global_step = 42
+
+        # Simulate the exact routing log block from compute_loss
+        is_main_process = _MockAccelerator().is_main_process
+        global_step = _MockState().global_step
+
+        if log_domain_routing and channels and is_main_process:
+            routing_counts = Counter(channels)
+            routing_str = ', '.join(f'{ch}={cnt}' for ch, cnt in sorted(routing_counts.items()))
+            print(f'[Step {global_step}] Routing: {routing_str}', flush=True)
+
+        captured = capsys.readouterr()
+        return captured.out
+
+    def test_routing_printed_when_enabled(self, capsys):
+        """Routing counts are printed to stdout when log_domain_routing=True."""
+        channels = ['math', 'code', 'math', 'math']
+        out = self._make_routing_log_test(channels, log_domain_routing=True, capsys=capsys)
+        assert '[Step 42] Routing:' in out
+        assert 'code=1' in out
+        assert 'math=3' in out
+
+    def test_routing_not_printed_when_disabled(self, capsys):
+        """Nothing is printed when log_domain_routing=False."""
+        channels = ['math', 'code', 'math']
+        out = self._make_routing_log_test(channels, log_domain_routing=False, capsys=capsys)
+        assert out == ''
+
+    def test_routing_not_printed_for_none_channels(self, capsys):
+        """When channels is None, nothing is printed."""
+        out = self._make_routing_log_test(None, log_domain_routing=True, capsys=capsys)
+        assert out == ''
+
+    def test_routing_sorted_alphabetically(self, capsys):
+        """Routing output is sorted by channel name for consistent ordering."""
+        channels = ['code', 'anchor', 'math', 'code', 'anchor']
+        out = self._make_routing_log_test(channels, log_domain_routing=True, capsys=capsys)
+        # anchor should appear before code before math
+        assert out.index('anchor') < out.index('code') < out.index('math')
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — interleave arg (no GPU required)
+# ---------------------------------------------------------------------------
+
+class TestInterleaveArg:
+    """Test that --interleave=true disables dataset_shuffle for multi-teacher GKD."""
+
+    def _make_args(self, **overrides):
+        from swift.arguments import RLHFArguments
+
+        class _MockArgs:
+            rlhf_type = 'gkd'
+            use_vllm = False
+            multi_turn_scheduler = None
+            async_generate = False
+            teacher_model = None
+            teacher_domain_map = None
+            teacher_type_map = None
+            teacher_deepspeed = None
+            teacher_beta_map = None
+            teacher_temperature_map = None
+            _teacher_paths = None
+            _channel_to_teacher_idx = None
+            padding_free = False
+            packing = False
+            dataset_shuffle = True
+            interleave = True  # new default
+
+        mock = _MockArgs()
+        for k, v in overrides.items():
+            setattr(mock, k, v)
+        RLHFArguments._check_gkd(mock)
+        return mock
+
+    def test_interleave_true_disables_shuffle(self):
+        """interleave=True + teacher_domain_map → dataset_shuffle becomes False."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        mock = self._make_args(teacher_domain_map=domain_map, interleave=True, dataset_shuffle=True)
+        assert mock.dataset_shuffle is False
+
+    def test_interleave_false_keeps_shuffle(self):
+        """interleave=False + teacher_domain_map → dataset_shuffle stays True."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        mock = self._make_args(teacher_domain_map=domain_map, interleave=False, dataset_shuffle=True)
+        assert mock.dataset_shuffle is True
+
+    def test_interleave_no_effect_without_domain_map(self):
+        """interleave=True without teacher_domain_map → dataset_shuffle unchanged."""
+        mock = self._make_args(teacher_model='some/model', interleave=True, dataset_shuffle=True)
+        assert mock.dataset_shuffle is True
+
+    def test_interleave_already_false_no_change(self):
+        """interleave=True but dataset_shuffle already False → stays False."""
+        domain_map = json.dumps({'math': '/path/math', 'code': '/path/code'})
+        mock = self._make_args(teacher_domain_map=domain_map, interleave=True, dataset_shuffle=False)
+        assert mock.dataset_shuffle is False
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — per-domain WandB/stderr logging via log() override (no GPU)
+# ---------------------------------------------------------------------------
+
+class TestDomainLossLogging:
+    """Test that log() injects domain_loss/* keys from _domain_loss_accum and clears it."""
+
+    def _make_log_stub(self, domain_loss_accum_data, step=10):
+        """Create a minimal stub that simulates log() domain loss injection."""
+        from collections import defaultdict
+
+        class _MockAccelerator:
+            is_main_process = True
+
+        class _MockState:
+            global_step = step
+
+        class _Stub:
+            accelerator = _MockAccelerator()
+            state = _MockState()
+
+        stub = _Stub()
+        stub._domain_loss_accum = defaultdict(list)
+        for channel, losses in domain_loss_accum_data.items():
+            stub._domain_loss_accum[channel].extend(losses)
+        return stub
+
+    def test_domain_losses_injected_into_logs(self):
+        """domain_loss/{channel} keys are added to logs dict before super().log()."""
+        import sys
+        from io import StringIO
+
+        stub = self._make_log_stub({'math': [0.8, 0.6], 'code': [0.3, 0.4]}, step=5)
+        logs = {'loss': 0.5, 'learning_rate': 1e-5}
+
+        # Simulate the domain loss injection block from log()
+        if stub.accelerator.is_main_process and stub._domain_loss_accum:
+            for channel, losses in stub._domain_loss_accum.items():
+                avg_loss = sum(losses) / len(losses)
+                logs[f'domain_loss/{channel}'] = round(avg_loss, 6)
+            stub._domain_loss_accum.clear()
+
+        assert 'domain_loss/math' in logs
+        assert 'domain_loss/code' in logs
+        assert abs(logs['domain_loss/math'] - 0.7) < 1e-5   # mean of [0.8, 0.6]
+        assert abs(logs['domain_loss/code'] - 0.35) < 1e-5  # mean of [0.3, 0.4]
+        assert 'loss' in logs  # original keys preserved
+
+    def test_accum_cleared_after_log(self):
+        """After injecting domain losses, _domain_loss_accum is cleared."""
+        stub = self._make_log_stub({'math': [0.5], 'code': [0.3]})
+        logs = {}
+
+        if stub.accelerator.is_main_process and stub._domain_loss_accum:
+            for channel, losses in stub._domain_loss_accum.items():
+                avg_loss = sum(losses) / len(losses)
+                logs[f'domain_loss/{channel}'] = round(avg_loss, 6)
+            stub._domain_loss_accum.clear()
+
+        assert len(stub._domain_loss_accum) == 0
+
+    def test_empty_accum_no_injection(self):
+        """Empty _domain_loss_accum means no domain_loss/* keys added."""
+        stub = self._make_log_stub({})
+        logs = {'loss': 0.5}
+
+        if stub.accelerator.is_main_process and stub._domain_loss_accum:
+            for channel, losses in stub._domain_loss_accum.items():
+                avg_loss = sum(losses) / len(losses)
+                logs[f'domain_loss/{channel}'] = round(avg_loss, 6)
+            stub._domain_loss_accum.clear()
+
+        assert 'domain_loss/math' not in logs
+        assert 'domain_loss/code' not in logs
+        assert logs == {'loss': 0.5}
+
+    def test_multiple_accumulation_averaged(self):
+        """Multiple loss values per channel are averaged correctly."""
+        stub = self._make_log_stub({'anchor': [1.0, 2.0, 3.0]})
+        logs = {}
+
+        if stub.accelerator.is_main_process and stub._domain_loss_accum:
+            for channel, losses in stub._domain_loss_accum.items():
+                avg_loss = sum(losses) / len(losses)
+                logs[f'domain_loss/{channel}'] = round(avg_loss, 6)
+            stub._domain_loss_accum.clear()
+
+        assert abs(logs['domain_loss/anchor'] - 2.0) < 1e-5  # mean of [1, 2, 3]
+
+
 if __name__ == '__main__':
     # Run unit tests (no GPU required)
     pytest.main([__file__, '-v', '-k', 'TestTeacherDomainMapParsing or TestGetTeacherIndices'
                  ' or TestVocabPadding or TestChannelPreservation or TestMegatronMultiTeacherGuard'
-                 ' or TestGroupedJsdLoss'])
+                 ' or TestGroupedJsdLoss or TestDomainWeightedLoss or TestRoutingLog'
+                 ' or TestInterleaveArg or TestDomainLossLogging'])

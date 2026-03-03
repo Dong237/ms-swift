@@ -280,6 +280,33 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             'Keys must be a subset of --teacher_domain_map keys. '
             'Omitted channels use the global --temperature value.'
         })
+    # Multi-teacher observability and loss balance
+    log_domain_routing: bool = field(
+        default=True,
+        metadata={
+            'help':
+            'Print per-batch teacher routing distribution to stdout (rank 0 only). '
+            'Shows how many samples are routed to each teacher domain per training step. '
+            'Only active when --teacher_domain_map is set.'
+        })
+    enable_weighted_domain_loss: bool = field(
+        default=True,
+        metadata={
+            'help':
+            'When True (default) and using multi-teacher GKD with multiple domains in a batch, '
+            'compute per-domain token-averaged loss then average equally across domains. '
+            'Prevents high-KL domains from dominating the gradient. '
+            'When False, uses global token-averaging across all channels (original behavior).'
+        })
+    interleave: bool = field(
+        default=True,
+        metadata={
+            'help':
+            'When True (default) and using multi-teacher GKD, disables dataset shuffling so '
+            'datasets are concatenated in domain order, producing homogeneous batches where '
+            'all samples in a batch come from the same teacher domain. '
+            'Set to False to use the original shuffle behavior (mixed-domain batches).'
+        })
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 
@@ -720,3 +747,11 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
                             raise ValueError(f'teacher_temperature_map["{domain}"]={value} must be > 0')
                 setattr(self, attr_name, raw_value)
                 logger.info(f'  Per-teacher {map_name}: {raw_value}')
+
+        # Interleave=True with multi-teacher: disable dataset shuffle for homogeneous batches
+        if self.teacher_domain_map is not None and getattr(self, 'interleave', True):
+            if getattr(self, 'dataset_shuffle', True):
+                logger.info(
+                    'Multi-teacher GKD with --interleave true: disabling dataset_shuffle '
+                    'to produce homogeneous batches. Use --interleave false to restore shuffling.')
+                self.dataset_shuffle = False

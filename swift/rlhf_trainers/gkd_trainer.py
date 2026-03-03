@@ -66,6 +66,11 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         self.generation_config = model.generation_config
         self._metrics = {'train': defaultdict(list), 'eval': defaultdict(list)}
         self._total_train_tokens = 0
+        # Multi-teacher observability and loss balance
+        self.log_domain_routing = getattr(args, 'log_domain_routing', True)
+        self.enable_weighted_domain_loss = getattr(args, 'enable_weighted_domain_loss', True)
+        # Accumulated per-domain losses for WandB logging (flushed in log())
+        self._domain_loss_accum: Dict[str, list] = defaultdict(list)
 
         # Initialize logging components
         self._prepare_logging()
@@ -422,6 +427,77 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             return total_loss
         return total_loss / total_tokens
 
+    def _compute_domain_weighted_jsd_loss(self, flat_student_logits, flat_teacher_logits, channels, mask):
+        """Compute JSD loss with equal per-domain weighting to prevent high-KL domains from dominating.
+
+        Groups flattened masked tokens by channel name, computes token-averaged JSD loss per domain,
+        then returns the mean of per-domain losses (equal domain weight regardless of token count).
+        Also populates self._domain_loss_accum for per-domain WandB logging.
+
+        Uses per-teacher beta/temperature from channel_to_beta/channel_to_temperature if set.
+
+        Args:
+            flat_student_logits: [1, num_valid_tokens, vocab] masked/flattened student logits
+            flat_teacher_logits: [1, num_valid_tokens, vocab] masked/flattened teacher logits
+            channels: list of channel names per sample (length = batch_size)
+            mask: [batch, seq_len] boolean mask (maps sample index -> token count)
+        """
+        global_beta = self.beta
+        global_temp = self.temperature
+
+        # Build per-token channel labels by expanding sample-level channels using mask token counts
+        token_channels = []
+        for i in range(mask.shape[0]):
+            n_tokens = mask[i].sum().item()
+            ch = channels[i] if channels and i < len(channels) else None
+            token_channels.extend([ch] * int(n_tokens))
+
+        # Group flat token indices by channel name
+        channel_to_indices = defaultdict(list)
+        for tok_idx, ch in enumerate(token_channels):
+            channel_to_indices[ch].append(tok_idx)
+
+        unique_channels = list(channel_to_indices.keys())
+
+        # Single channel in batch: fall back to standard loss (no domain weighting needed)
+        if len(unique_channels) <= 1:
+            ch = unique_channels[0] if unique_channels else None
+            beta = self.channel_to_beta.get(ch, global_beta) if self.channel_to_beta and ch else global_beta
+            temp = self.channel_to_temperature.get(ch, global_temp) if self.channel_to_temperature and ch else global_temp
+            loss = self.generalized_jsd_loss(
+                student_logits=flat_student_logits,
+                teacher_logits=flat_teacher_logits,
+                beta=beta,
+                temperature=temp,
+            )
+            if ch is not None:
+                self._domain_loss_accum[ch].append(loss.item())
+            return loss
+
+        # Squeeze batch dim: [1, N, V] -> [N, V]
+        student_logits_2d = flat_student_logits.squeeze(0)
+        teacher_logits_2d = flat_teacher_logits.squeeze(0)
+
+        per_domain_losses = []
+        for ch, indices in channel_to_indices.items():
+            idx_tensor = torch.tensor(indices, device=student_logits_2d.device, dtype=torch.long)
+            group_student = student_logits_2d[idx_tensor]
+            group_teacher = teacher_logits_2d[idx_tensor]
+            beta = self.channel_to_beta.get(ch, global_beta) if self.channel_to_beta and ch else global_beta
+            temp = self.channel_to_temperature.get(ch, global_temp) if self.channel_to_temperature and ch else global_temp
+            domain_loss = self.generalized_jsd_loss(
+                student_logits=group_student.unsqueeze(0),
+                teacher_logits=group_teacher.unsqueeze(0),
+                beta=beta,
+                temperature=temp,
+            )
+            per_domain_losses.append(domain_loss)
+            if ch is not None:
+                self._domain_loss_accum[ch].append(domain_loss.item())
+
+        # Equal-weight average across domains
+        return sum(per_domain_losses) / len(per_domain_losses)
+
     @patch_profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Get data source: DataSource.STUDENT, DataSource.TEACHER, or DataSource.DATASET
@@ -438,6 +514,13 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         # Determine per-sample teacher routing
         teacher_indices = self._get_teacher_indices(channels)
         use_multi_teacher = teacher_indices is not None and len(set(teacher_indices)) > 1
+
+        # Log per-batch routing distribution to stdout (rank 0, gated by log_domain_routing)
+        if self.log_domain_routing and channels and self.accelerator.is_main_process:
+            from collections import Counter
+            routing_counts = Counter(channels)
+            routing_str = ', '.join(f'{ch}={cnt}' for ch, cnt in sorted(routing_counts.items()))
+            print(f'[Step {self.state.global_step}] Routing: {routing_str}', flush=True)
 
         has_per_teacher_params = (self.channel_to_beta or self.channel_to_temperature) and channels
         if self.use_liger_gkd_loss and not use_multi_teacher and not has_per_teacher_params:
@@ -557,8 +640,12 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 shifted_teacher_logits[..., tea_dim:] = shifted_student_logits[..., tea_dim:]
 
             # compute loss
-            if (self.channel_to_beta or self.channel_to_temperature) and channels:
-                # Per-teacher hyperparameters: group tokens by (beta, temp) and compute loss per group
+            if self.enable_weighted_domain_loss and use_multi_teacher:
+                # New: equal per-domain weighting (also handles per-teacher beta/temp)
+                loss = self._compute_domain_weighted_jsd_loss(
+                    shifted_student_logits, shifted_teacher_logits, channels, mask)
+            elif (self.channel_to_beta or self.channel_to_temperature) and channels:
+                # Per-teacher hyperparameters only: group tokens by (beta, temp), token-weighted
                 loss = self._compute_grouped_jsd_loss(
                     shifted_student_logits, shifted_teacher_logits, channels, mask)
             else:
@@ -885,6 +972,18 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         """Override log method to include completion table logging (aligned with GRPO)."""
+        import sys
+        # Inject per-domain losses into logs before calling super (so WandB gets them)
+        if self.accelerator.is_main_process and self._domain_loss_accum:
+            for channel, losses in self._domain_loss_accum.items():
+                avg_loss = sum(losses) / len(losses)
+                logs[f'domain_loss/{channel}'] = round(avg_loss, 6)
+                print(
+                    f'[Step {self.state.global_step}] domain_loss/{channel} = {avg_loss:.4f}',
+                    file=sys.stderr,
+                    flush=True)
+            self._domain_loss_accum.clear()
+
         # Call parent log method
         import transformers
         from packaging import version
