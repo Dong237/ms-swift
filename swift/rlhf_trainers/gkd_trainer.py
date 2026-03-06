@@ -68,7 +68,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         self._total_train_tokens = 0
         # Multi-teacher observability and loss balance
         self.log_domain_routing = getattr(args, 'log_domain_routing', True)
-        self.enable_weighted_domain_loss = getattr(args, 'enable_weighted_domain_loss', True)
+        self.enable_weighted_domain_loss = getattr(args, 'enable_weighted_domain_loss', False)
+        self.domain_loss_weights = getattr(args, '_domain_loss_weights', None)
         # Accumulated per-domain losses for WandB logging (flushed in log())
         self._domain_loss_accum: Dict[str, list] = defaultdict(list)
 
@@ -428,10 +429,11 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         return total_loss / total_tokens
 
     def _compute_domain_weighted_jsd_loss(self, flat_student_logits, flat_teacher_logits, channels, mask):
-        """Compute JSD loss with equal per-domain weighting to prevent high-KL domains from dominating.
+        """Compute JSD loss with per-domain weighting.
 
         Groups flattened masked tokens by channel name, computes token-averaged JSD loss per domain,
-        then returns the mean of per-domain losses (equal domain weight regardless of token count).
+        then returns the weighted sum of per-domain losses. By default uses equal weights (1/N);
+        if self.domain_loss_weights is set, uses explicit per-domain weights.
         Also populates self._domain_loss_accum for per-domain WandB logging.
 
         Uses per-teacher beta/temperature from channel_to_beta/channel_to_temperature if set.
@@ -479,6 +481,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         teacher_logits_2d = flat_teacher_logits.squeeze(0)
 
         per_domain_losses = []
+        domain_names = []
         for ch, indices in channel_to_indices.items():
             idx_tensor = torch.tensor(indices, device=student_logits_2d.device, dtype=torch.long)
             group_student = student_logits_2d[idx_tensor]
@@ -492,10 +495,16 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 temperature=temp,
             )
             per_domain_losses.append(domain_loss)
+            domain_names.append(ch)
             if ch is not None:
                 self._domain_loss_accum[ch].append(domain_loss.item())
 
-        # Equal-weight average across domains
+        # Weighted average across domains (explicit weights or equal 1/N)
+        if self.domain_loss_weights:
+            weighted_loss = sum(
+                self.domain_loss_weights.get(ch, 1.0 / len(per_domain_losses)) * loss
+                for ch, loss in zip(domain_names, per_domain_losses))
+            return weighted_loss
         return sum(per_domain_losses) / len(per_domain_losses)
 
     @patch_profiling_decorator

@@ -114,7 +114,7 @@ fi
 # ─── Launch Training ───
 # v2 new args:
 #   --interleave true              concat datasets in domain order; avoids ~96% mixed-domain batches caused by shuffle
-#   --enable_weighted_domain_loss  mean of per-domain token-averaged losses; prevents high-KL domain (math) from drowning anchor signal
+#   --enable_weighted_domain_loss  false = global token-weighted loss (default); true = equal per-domain weighting (experimental)
 #   --log_domain_routing true      print "Routing: math->[0]=4, anchor_memory->[0]=4" to stdout every step
 swift rlhf \
     --rlhf_type gkd \
@@ -161,7 +161,7 @@ swift rlhf \
     --run_name "$run_name" \
     --sleep_level 0 \
     --interleave true \
-    --enable_weighted_domain_loss true \
+    --enable_weighted_domain_loss false \
     --log_domain_routing true \
     $EXTRA_ARGS \
     > >(tee "$STDOUT_LOG") 2> >(tee "$STDERR_LOG" >&2)

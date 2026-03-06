@@ -290,13 +290,23 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             'Only active when --teacher_domain_map is set.'
         })
     enable_weighted_domain_loss: bool = field(
-        default=True,
+        default=False,
         metadata={
             'help':
-            'When True (default) and using multi-teacher GKD with multiple domains in a batch, '
-            'compute per-domain token-averaged loss then average equally across domains. '
-            'Prevents high-KL domains from dominating the gradient. '
-            'When False, uses global token-averaging across all channels (original behavior).'
+            'When True and using multi-teacher GKD with multiple domains in a batch, '
+            'compute per-domain token-averaged loss then average across domains '
+            '(equal weight by default, or use --domain_loss_weights for explicit weights). '
+            'When False (default), uses global token-averaging across all channels — this matches '
+            'the original training behavior where high-token/high-KL domains naturally get more gradient signal.'
+        })
+    domain_loss_weights: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'JSON dict mapping channel names to loss weights when --enable_weighted_domain_loss is True. '
+            'Example: \'{"code": 0.8, "anchor_memory": 0.2}\'. Weights are normalized to sum to 1. '
+            'If not set, all domains get equal weight (1/N). '
+            'Requires --enable_weighted_domain_loss true.'
         })
     interleave: bool = field(
         default=True,
@@ -748,6 +758,29 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
                             raise ValueError(f'teacher_temperature_map["{domain}"]={value} must be > 0')
                 setattr(self, attr_name, raw_value)
                 logger.info(f'  Per-teacher {map_name}: {raw_value}')
+
+        # Parse domain_loss_weights (optional, requires enable_weighted_domain_loss)
+        self._domain_loss_weights = None
+        if getattr(self, 'domain_loss_weights', None) is not None:
+            if not getattr(self, 'enable_weighted_domain_loss', False):
+                logger.warning('--domain_loss_weights is set but --enable_weighted_domain_loss is False. '
+                               'Enabling weighted domain loss automatically.')
+                self.enable_weighted_domain_loss = True
+            import json
+            raw = self.domain_loss_weights
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if not isinstance(raw, dict):
+                raise ValueError(f'domain_loss_weights must be a JSON dict, got {type(raw)}')
+            for domain, weight in raw.items():
+                if not isinstance(weight, (int, float)) or weight < 0:
+                    raise ValueError(f'domain_loss_weights["{domain}"]={weight} must be a non-negative number')
+            # Normalize weights to sum to 1
+            total = sum(raw.values())
+            if total <= 0:
+                raise ValueError('domain_loss_weights must have a positive total sum')
+            self._domain_loss_weights = {k: v / total for k, v in raw.items()}
+            logger.info(f'  Per-domain loss weights (normalized): {self._domain_loss_weights}')
 
         # Interleave=True with multi-teacher: disable ALL shuffle sources for more ordered batches.
         # Both dataset_shuffle (pre-DataLoader concat) and train_dataloader_shuffle (sampler)
