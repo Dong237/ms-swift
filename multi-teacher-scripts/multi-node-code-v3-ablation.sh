@@ -51,7 +51,7 @@ CUSTOM_DATASET_INFO="/mnt/bn/youxiang-lf/data/dataset_info_ms_swift.json"
 TEACHER_DOMAIN_MAP="{\"code\":\"${CODE_TEACHER}\",\"anchor_memory\":\"${ANCHOR_MEMORY_TEACHER}\"}"
 TEACHER_TYPE_MAP='{"code":"qwen3","anchor_memory":"qwen3"}'
 
-run_name="Qwen3-1.7B-multi-teacher-gkd-code-8B-anchor-8b-200700-v3-ablation"
+run_name="LiveLLM-1.7B-v1-multi-teacher-gkd-v1.1.0-code-8B-anchor-8b-200700-ablation"
 OUTPUT_DIR="/mnt/bn/youxiang-lf/models/$run_name"
 export WANDB_NAME="$run_name"
 

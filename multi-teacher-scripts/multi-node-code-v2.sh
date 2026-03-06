@@ -86,7 +86,7 @@ TEACHER_TYPE_MAP='{"code":"qwen3","anchor_memory":"qwen3"}'
 # TEACHER_BETA_MAP='{"code": 0.7, "anchor_memory": 0.95}'
 # TEACHER_TEMPERATURE_MAP='{"code": 1.0, "anchor_memory": 0.8}'
 
-run_name="Qwen3-1.7B-multi-teacher-gkd-code-8B-anchor-8b-200700-v2"
+run_name="LiveLLM-1.7B-v1-multi-teacher-gkd-v1.1.0-code-8B-anchor-8b-200700"
 OUTPUT_DIR="/mnt/bn/youxiang-lf/models/$run_name"
 export WANDB_NAME="$run_name"
 

@@ -56,7 +56,7 @@ ANCHOR_MEMORY_TEACHER="/mnt/bn/youxiang-lf/models/qwen3_8b_instruct-anchor-memor
 
 CUSTOM_DATASET_INFO="/mnt/bn/youxiang-lf/data/dataset_info_ms_swift.json"
 
-run_name="Qwen3-1.7B-single-teacher-gkd-anchor-8b-200700-pinned-deps"
+run_name="LiveLLM-1.7B-v1-multi-teacher-gkd-v1.1.0-single-teacher-anchor-8b-200700-pinned-deps"
 OUTPUT_DIR="/mnt/bn/youxiang-lf/models/$run_name"
 export WANDB_NAME="$run_name"
 
