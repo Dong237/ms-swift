@@ -15,7 +15,6 @@ import trl
 from accelerate.utils import gather_object, is_peft_model
 from packaging import version
 from transformers import PreTrainedModel
-from trl import GKDTrainer as HFGKDTrainer
 from trl import SFTTrainer as HFSFTTrainer
 
 from swift.template import TemplateInputs
@@ -31,6 +30,11 @@ try:
     _liger_kernel_available = True
 except ImportError:
     _liger_kernel_available = False
+
+if version.parse(trl.__version__) >= version.parse('0.26.0'):
+    from trl.experimental.gkd import GKDTrainer as HFGKDTrainer
+else:
+    from trl import GKDTrainer as HFGKDTrainer
 
 del HFGKDTrainer.__init__
 del HFSFTTrainer.__init__
@@ -600,7 +604,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                     )
                     # loss / grad norm is unexpectedly large, normalize by sequence length
                     # https://github.com/linkedin/Liger-Kernel/blob/v0.6.3/src/liger_kernel/chunked_loss/jsd_loss.py#L9-L39
-                    loss /= student_hidden.shape[1]
+                    # loss /= student_hidden.shape[1]
                 # Release hidden states after loss computation
                 del student_hidden, teacher_hidden, true_labels
         else:
