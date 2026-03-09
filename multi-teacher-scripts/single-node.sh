@@ -4,7 +4,8 @@ set -euo pipefail
 pip install python-dotenv # Mark 'dotenv' as satisfied
 pip install python-dotenv dotenv==0.9.9 --no-deps 2>/dev/null || true
 pip install -r requirements.txt # Install main packages first (this might pull in the wrong protobuf)
-pip install 'ms-swift' msgspec transformers deepspeed vllm -U 
+pip install 'ms-swift' msgspec deepspeed vllm -U
+pip install 'transformers>=4.33,<5.3.0' -U
 pip install protobuf==3.20.3 --break-system-packages 
 
 

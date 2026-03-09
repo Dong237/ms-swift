@@ -15,7 +15,6 @@ import trl
 from accelerate.utils import gather_object, is_peft_model
 from packaging import version
 from transformers import PreTrainedModel
-from trl import GKDTrainer as HFGKDTrainer
 from trl import SFTTrainer as HFSFTTrainer
 
 from swift.template import TemplateInputs
@@ -32,8 +31,36 @@ try:
 except ImportError:
     _liger_kernel_available = False
 
-del HFGKDTrainer.__init__
-del HFSFTTrainer.__init__
+# TRL >= 0.26 moved GKDTrainer to trl.experimental.gkd
+if version.parse(trl.__version__) >= version.parse('0.26.0'):
+    from trl.experimental.gkd import GKDTrainer as HFGKDTrainer
+else:
+    from trl import GKDTrainer as HFGKDTrainer
+
+# Remove TRL's __init__ so ms-swift's SwiftMixin controls initialization.
+# Use try/except because some TRL versions may not define __init__ directly on the class.
+try:
+    del HFGKDTrainer.__init__
+except AttributeError:
+    pass
+try:
+    del HFSFTTrainer.__init__
+except AttributeError:
+    pass
+
+# Safety fallback: if TRL's __init__ still leaks through (e.g. via intermediate parent classes),
+# patch transformers Trainer.__init__ to accept and ignore peft_config, which newer transformers removed.
+from transformers import Trainer as _HfTrainer
+_trainer_params = inspect.signature(_HfTrainer.__init__).parameters
+if 'peft_config' not in _trainer_params:
+    _orig_trainer_init = _HfTrainer.__init__
+
+    def _safe_trainer_init(self, *args, **kwargs):
+        kwargs.pop('peft_config', None)
+        kwargs.pop('formatting_func', None)
+        return _orig_trainer_init(self, *args, **kwargs)
+
+    _HfTrainer.__init__ = _safe_trainer_init
 
 logger = get_logger()
 if is_wandb_available():
@@ -609,7 +636,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                     )
                     # loss / grad norm is unexpectedly large, normalize by sequence length
                     # https://github.com/linkedin/Liger-Kernel/blob/v0.6.3/src/liger_kernel/chunked_loss/jsd_loss.py#L9-L39
-                    loss /= student_hidden.shape[1]
+                    # loss /= student_hidden.shape[1]
                 # Release hidden states after loss computation
                 del student_hidden, teacher_hidden, true_labels
         else:

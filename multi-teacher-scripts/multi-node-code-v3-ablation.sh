@@ -5,7 +5,8 @@ set -euo pipefail
 pip install python-dotenv dotenv==0.9.9 --no-deps 2>/dev/null || true
 pip install -r requirements.txt
 pip install -e .  # Install YOUR local ms-swift with multi-teacher support
-pip install msgspec transformers deepspeed vllm -U
+pip install msgspec deepspeed vllm -U
+pip install 'transformers>=4.33,<5.3.0' -U
 pip install protobuf==3.20.3 --break-system-packages
 
 # ═══════════════════════════════════════════════════════════════════════════
