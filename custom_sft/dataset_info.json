@@ -1,0 +1,6 @@
+[
+    {
+        "dataset_path": "/path/to/your/train.jsonl",
+        "tags": ["chat", "custom"]
+    }
+]
