@@ -577,6 +577,23 @@ register_template(
         is_thinking=True))
 
 
+class Qwen3_5EmbTemplate(Qwen3_5Template):
+
+    def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
+        super()._preprocess_inputs(inputs)
+        if len(inputs.messages) % 2 == 1 and inputs.messages[-1]['role'] != 'assistant':
+            inputs.messages.append({'role': 'assistant', 'content': ''})
+
+
+register_template(
+    QwenTemplateMeta(
+        MLLMTemplateType.qwen3_5_emb,
+        default_system=None,
+        suffix=['<|endoftext|>'],
+        template_cls=Qwen3_5EmbTemplate,
+    ))
+
+
 class Qwen3VLEmbTemplate(Qwen3VLTemplate):
 
     def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:

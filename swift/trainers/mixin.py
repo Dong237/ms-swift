@@ -1240,11 +1240,13 @@ class DataLoaderMixin:
     @contextmanager
     def _disable_group_by_length(self):
         group_by_length = getattr(self.args, 'group_by_length', False)
-        self.args.group_by_length = False
+        if hasattr(self.args, 'group_by_length'):
+            self.args.group_by_length = False
         try:
             yield
         finally:
-            self.args.group_by_length = group_by_length
+            if hasattr(self.args, 'group_by_length'):
+                self.args.group_by_length = group_by_length
 
     def get_eval_dataloader(self, eval_dataset=None):
         dataloader = None

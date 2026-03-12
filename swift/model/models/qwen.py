@@ -1186,6 +1186,34 @@ register_model(
         tags=['vision', 'video']))
 
 
+class Qwen3_5EmbLoader(Qwen3_5Loader):
+    pass
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.qwen3_5_emb,
+        [
+            ModelGroup(
+                [
+                    Model('Qwen/Qwen3.5-0.8B', 'Qwen/Qwen3.5-0.8B'),
+                    Model('Qwen/Qwen3.5-0.8B-Base', 'Qwen/Qwen3.5-0.8B-Base'),
+                    Model('Qwen/Qwen3.5-2B', 'Qwen/Qwen3.5-2B'),
+                    Model('Qwen/Qwen3.5-2B-Base', 'Qwen/Qwen3.5-2B-Base'),
+                    Model('Qwen/Qwen3.5-4B', 'Qwen/Qwen3.5-4B'),
+                    Model('Qwen/Qwen3.5-4B-Base', 'Qwen/Qwen3.5-4B-Base'),
+                    Model('Qwen/Qwen3.5-9B', 'Qwen/Qwen3.5-9B'),
+                    Model('Qwen/Qwen3.5-9B-Base', 'Qwen/Qwen3.5-9B-Base'),
+                ],
+                TemplateType.qwen3_5_emb),
+        ],
+        Qwen3_5EmbLoader,
+        model_arch=ModelArch.qwen2_vl,
+        architectures=['Qwen3_5ForConditionalGeneration'],
+        requires=['transformers>=5.0.0.dev', 'qwen_vl_utils>=0.0.14', 'decord'],
+        tags=['vision', 'video']))
+
+
 class Qwen2_5OmniLoader(ModelLoader):
 
     def get_config(self, model_dir):
