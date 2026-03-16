@@ -346,6 +346,90 @@ print(f'相似度分数: {scores}')
 print(f'最相关文档索引: {scores.argmax().item()}')
 ```
 
+### 4.4 使用 vLLM 加速推理
+
+vLLM 支持将训练好的 Qwen3.5 模型以 pooling 模式运行，提取嵌入向量。相比 TransformersEngine，vLLM 提供更高的吞吐量和更低的延迟，适合大规模生产部署。
+
+**环境要求**：
+- vLLM >= 0.8.5（建议使用最新版本以获得 Qwen3.5 架构支持）
+- transformers >= 5.0
+
+**原理**：vLLM 的 pooling runner 使用 `pooling_type="LAST"` 提取序列最后一个 token 的隐藏状态，这与我们训练时使用的 EOS token（`<|endoftext|>`）pooling 策略语义等价。
+
+#### 4.4.1 离线批量推理
+
+适用于一次性编码大量文本的场景：
+
+```python
+from vllm import LLM
+import torch
+
+# 加载训练好的嵌入模型（pooling 模式）
+llm = LLM(
+    model='output/qwen3_5_emb_phase2/checkpoint-best',
+    runner='pooling',
+    dtype='bfloat16',
+    max_model_len=4096,
+    override_pooler_config='{"pooling_type": "LAST", "normalize": true}',
+)
+
+# 构建待编码的文本
+prompts = [
+    "什么是机器学习？",
+    "机器学习是一种让计算机从数据中学习的方法。",
+    "今天北京天气晴朗。",
+]
+
+# 批量编码
+outputs = llm.encode(prompts)
+embeddings = [torch.tensor(output.outputs.data) for output in outputs]
+embedding_matrix = torch.stack(embeddings)
+
+# 计算余弦相似度
+norms = embedding_matrix.norm(dim=1, keepdim=True)
+similarity = (embedding_matrix @ embedding_matrix.T) / (norms @ norms.T)
+print(f'余弦相似度矩阵:\n{similarity}')
+```
+
+#### 4.4.2 在线 API 服务
+
+启动 OpenAI 兼容的嵌入 API 服务器：
+
+```bash
+vllm serve output/qwen3_5_emb_phase2/checkpoint-best \
+    --runner pooling \
+    --dtype bfloat16 \
+    --max-model-len 4096 \
+    --override-pooler-config '{"pooling_type": "LAST", "normalize": true}' \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+调用 API：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+texts = ["什么是机器学习？", "机器学习是一种让计算机从数据中学习的方法。"]
+response = client.embeddings.create(model="checkpoint-best", input=texts)
+
+for i, emb in enumerate(response.data):
+    print(f"文本 {i}: 向量维度 = {len(emb.embedding)}")
+```
+
+#### 4.4.3 注意事项
+
+| 项目 | 说明 |
+|------|------|
+| **版本要求** | vLLM >= 0.8.5，transformers >= 5.0 |
+| **pooling_type** | 必须设置为 `LAST`，对应 EOS token 位置的隐藏状态 |
+| **normalize** | 建议设置为 `true`，与训练时的 L2 归一化一致 |
+| **适用场景** | 大规模批量编码（>1000 条文本）或在线服务 |
+| **兼容性** | Qwen3.5 使用混合 GDN+注意力架构，若遇到兼容性问题请回退至 TransformersEngine |
+| **chat template** | vLLM 会自动使用模型的 tokenizer chat template；若需自定义，可通过 `--chat-template` 指定 |
+
 ---
 
 ## 5. 训练技巧
