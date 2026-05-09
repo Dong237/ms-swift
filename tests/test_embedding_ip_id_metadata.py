@@ -181,7 +181,18 @@ class TestEmbeddingTrainerIpIdSideChannel(unittest.TestCase):
         trainer.compute_loss_func = loss_capture
         trainer.model_accepts_loss_kwargs = False
         trainer.args = SimpleNamespace(gradient_accumulation_steps=1)
+        trainer.task_type = 'embedding'
+        trainer.problem_type = None
         trainer._compute_acc = lambda outputs, labels: None
+        return trainer
+
+    def _make_trainer_stub_with_real_acc(self, loss_capture):
+        trainer = object.__new__(EmbeddingTrainer)
+        trainer.compute_loss_func = loss_capture
+        trainer.model_accepts_loss_kwargs = False
+        trainer.args = SimpleNamespace(gradient_accumulation_steps=1)
+        trainer.task_type = 'embedding'
+        trainer.problem_type = None
         return trainer
 
     def test_compute_loss_pops_ip_ids_before_model_forward_and_passes_to_loss(self):
@@ -232,6 +243,24 @@ class TestEmbeddingTrainerIpIdSideChannel(unittest.TestCase):
 
         self.assertEqual(float(loss), 0.5)
         self.assertNotIn('ip_ids', captured['kwargs'])
+
+    def test_compute_loss_skips_embedding_acc_for_dict_outputs(self):
+        def loss_capture(outputs, labels, **kwargs):
+            return outputs['last_hidden_state'].sum() * 0 + torch.tensor(0.75)
+
+        class Model:
+            def __call__(self, **kwargs):
+                return {'last_hidden_state': kwargs['input_ids'].float()}
+
+        trainer = self._make_trainer_stub_with_real_acc(loss_capture)
+        inputs = {
+            'input_ids': torch.ones(2, 2),
+            'labels': torch.tensor([2.0, 1.0]),
+        }
+
+        loss = trainer.compute_loss(Model(), inputs)
+
+        self.assertEqual(float(loss), 0.75)
 
 
 if __name__ == '__main__':

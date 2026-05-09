@@ -29,8 +29,8 @@ class EmbeddingTrainer(Trainer):
             if num_items_in_batch is not None and self.model_accepts_loss_kwargs:
                 loss = loss / self.args.gradient_accumulation_steps
 
-            if labels is not None:
-                self._compute_acc(outputs, labels)
+            # Skip _compute_acc: embedding outputs are dicts with 'last_hidden_state',
+            # not model outputs with .logits. Accuracy is not meaningful for retrieval tasks.
 
             return (loss, outputs) if return_outputs else loss
         return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)

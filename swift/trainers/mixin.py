@@ -999,13 +999,13 @@ class SwiftMixin:
 
     def _compute_acc(self, outputs, labels, cu_seqlens=None) -> None:
         args = self.args
-        logits = outputs.logits
         metrics = None
         task_type = self.task_type
         problem_type = self.problem_type
         if task_type == 'embedding':
             return
-        elif task_type == 'seq_cls':
+        logits = outputs.logits
+        if task_type == 'seq_cls':
             if problem_type == 'regression':
                 return
             elif problem_type == 'multi_label_classification':
