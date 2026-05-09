@@ -30,6 +30,8 @@ class RowPreprocessor:
                                 'label',
                                 'channel',
                                 'margin',
+                                'ip_id',
+                                'ip_name',
                             ]
 
     def __init__(self,

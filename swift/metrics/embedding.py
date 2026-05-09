@@ -6,7 +6,7 @@ from transformers import EvalPrediction
 from transformers.utils import strtobool
 from typing import Dict
 
-from swift.loss.embedding import _parse_multi_negative_sentences, _parse_pair_sentence
+from swift.loss.embedding import _parse_multi_negative_sentences, _parse_multi_positive_sentences, _parse_pair_sentence
 from .base import EvalMetrics
 from .utils import Metric
 
@@ -155,3 +155,38 @@ class InfonceMetrics(EvalMetrics, EmbedddingMetricMixin):
         mean_neg = np.mean(neg_scores)
         mean_pos = np.mean(pos_scores)
         return {'margin': pos_neg_margin, 'mean_neg': mean_neg, 'mean_pos': mean_pos}
+
+
+class MultiPositiveInfonceMetrics(EvalMetrics, EmbedddingMetricMixin):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        EmbedddingMetricMixin.__init__(self)
+
+    def compute_metrics(self, eval_prediction: EvalPrediction) -> Dict[str, float]:
+        predictions = eval_prediction.predictions
+        labels = eval_prediction.label_ids
+        return self._calculate_metrics(predictions, labels)
+
+    def _calculate_metrics(self, predictions, labels):
+        groups = _parse_multi_positive_sentences(torch.tensor(predictions), torch.tensor(labels))
+
+        pos_scores_all = []
+        neg_scores_all = []
+        margins = []
+
+        for anchor, positives, negatives in groups:
+            anchor_np = anchor.numpy()
+            pos_sims = np.dot(positives.numpy(), anchor_np)
+            pos_scores_all.extend(pos_sims.tolist())
+
+            if negatives.numel() > 0:
+                neg_sims = np.dot(negatives.numpy(), anchor_np)
+                neg_scores_all.extend(neg_sims.tolist())
+                margins.append(float(np.mean(pos_sims) - np.max(neg_sims)))
+
+        mean_pos = float(np.mean(pos_scores_all)) if pos_scores_all else 0.0
+        mean_neg = float(np.mean(neg_scores_all)) if neg_scores_all else 0.0
+        margin = float(np.mean(margins)) if margins else 0.0
+
+        return {'margin': margin, 'mean_neg': mean_neg, 'mean_pos': mean_pos}

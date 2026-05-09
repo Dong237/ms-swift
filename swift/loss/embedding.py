@@ -319,3 +319,260 @@ class InfonceLoss(BaseLoss):
                     length += tensor.size(0) - 1
                 loss /= len(split_tensors)
         return loss
+
+
+def _parse_multi_positive_sentences(sentences, labels):
+    """Parse sentence groups where each group has variable positives and negatives.
+
+    Label encoding: 2.0 = group boundary (first positive), 1.0 = additional positive, 0.0 = negative.
+    Sentence ordering per group: [anchor, pos0, pos1, ..., neg0, neg1, ...]
+
+    Returns:
+        List of (anchor, positives_tensor, negatives_tensor) tuples.
+    """
+    boundary_indices = torch.nonzero(labels == 2.0, as_tuple=False).squeeze(-1).tolist()
+    if isinstance(boundary_indices, int):
+        boundary_indices = [boundary_indices]
+
+    if len(boundary_indices) == 0:
+        raise ValueError(
+            'No group boundary (label==2.0) found in labels. '
+            'multi_positive_infonce requires labels with 2.0 markers. '
+            f'Got labels: {labels.tolist()}')
+
+    valid_values = {0.0, 1.0, 2.0}
+    unique_values = set(labels.tolist())
+    if not unique_values <= valid_values:
+        raise ValueError(
+            f'Labels contain invalid values: {unique_values - valid_values}. '
+            f'Expected only values in {{0.0, 1.0, 2.0}}.')
+
+    num_groups = len(boundary_indices)
+    expected_sentences = len(labels) + num_groups  # each group has 1 unlabeled anchor
+    if sentences.shape[0] != expected_sentences:
+        raise ValueError(
+            f'Sentence count ({sentences.shape[0]}) does not match '
+            f'expected count ({expected_sentences}) from labels. '
+            f'Expected len(labels)={len(labels)} + num_groups={num_groups}.')
+
+    boundary_indices.append(len(labels))
+
+    groups = []
+    for i in range(len(boundary_indices) - 1):
+        label_start = boundary_indices[i]
+        label_end = boundary_indices[i + 1]
+        group_labels = labels[label_start:label_end]
+
+        # Each label corresponds to a positive/negative after the anchor.
+        # Anchors are interleaved: the i-th anchor is at sentence index (label_start + i).
+        sent_start = label_start + i
+        sent_end = label_end + i + 1  # +1 for this group's anchor
+        group_sentences = sentences[sent_start:sent_end]
+
+        anchor = group_sentences[0]
+        num_positives = int((group_labels >= 1.0).sum().item())
+        positives = group_sentences[1:1 + num_positives]
+        negatives = group_sentences[1 + num_positives:]
+
+        groups.append((anchor, positives, negatives))
+
+    return groups
+
+
+class MultiPositiveInfonceLoss(BaseLoss):
+    """Multi-positive InfoNCE loss for embedding training.
+
+    Supports variable numbers of positives per anchor. Row-local only (no batch-global).
+
+    Loss = -log( sum_p exp(sim(q,p)/tau) / (sum_p exp(sim(q,p)/tau) + sum_n exp(sim(q,n)/tau)) )
+
+    With 1 positive, this reduces exactly to standard InfoNCE.
+    """
+
+    def __call__(self, outputs, labels, **kwargs) -> torch.Tensor:
+        temperature = float(os.environ.get('INFONCE_TEMPERATURE', '0.1'))
+        sentences = outputs['last_hidden_state']
+
+        groups = _parse_multi_positive_sentences(sentences, labels)
+
+        loss = torch.tensor(0.0, device=sentences.device, dtype=sentences.dtype)
+        for anchor, positives, negatives in groups:
+            # anchor: [D], positives: [P, D], negatives: [N, D]
+            pos_sim = torch.matmul(positives, anchor) / temperature  # [P]
+            neg_sim = torch.matmul(negatives, anchor) / temperature  # [N]
+
+            log_sum_pos = torch.logsumexp(pos_sim, dim=0)
+            all_sim = torch.cat([pos_sim, neg_sim], dim=0)  # [P+N]
+            log_sum_all = torch.logsumexp(all_sim, dim=0)
+
+            # -log(sum_pos / sum_all) = -(log_sum_pos - log_sum_all)
+            loss += -(log_sum_pos - log_sum_all)
+
+        loss /= len(groups)
+        return loss
+
+
+class SubcenterArcFaceHead(nn.Module):
+    """Sub-center ArcFace classification head with K sub-centers per class.
+
+    Each class has K learnable proxy vectors. Cosine similarity is computed
+    between input embeddings and all proxies, then max-pooled over K to get
+    the class logit. An additive angular margin is applied to the target class
+    logit before scaling and CrossEntropyLoss.
+
+    Reference: Sub-center ArcFace (ECCV 2020, Deng et al.)
+    """
+
+    def __init__(self, num_classes: int, embed_dim: int, K: int = 5, scale: float = 64.0, margin: float = 0.2):
+        super().__init__()
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.K = K
+        self.scale = scale
+        self.margin = margin
+        self.eps = 1e-7
+
+        self.proxies = nn.Parameter(torch.empty(num_classes, K, embed_dim))
+        nn.init.xavier_uniform_(self.proxies.view(num_classes * K, embed_dim))
+        self.proxies.data = self.proxies.data.view(num_classes, K, embed_dim)
+
+        self.ce_loss = nn.CrossEntropyLoss()
+
+    def forward(self, embeddings: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute Sub-center ArcFace loss.
+
+        Args:
+            embeddings: [N, D] L2-normalized feature vectors.
+            targets: [N] integer class labels.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        # L2-normalize features and proxies
+        x = F.normalize(embeddings, p=2, dim=1)  # [N, D]
+        W = F.normalize(self.proxies, p=2, dim=2)  # [C, K, D]
+
+        # Cosine similarity: [N, C, K]
+        cosine = torch.einsum('nd,ckd->nck', x, W)
+
+        # Max-pool over K sub-centers: [N, C]
+        cosine, _ = cosine.max(dim=2)
+
+        # Extract target cosine and apply angular margin
+        N = cosine.size(0)
+        target_cos = cosine[torch.arange(N, device=cosine.device), targets]
+        target_cos = torch.clamp(target_cos, -1.0 + self.eps, 1.0 - self.eps)
+        theta = torch.acos(target_cos)
+        target_logit = torch.cos(theta + self.margin)
+
+        # Replace target class logit with margin-applied version
+        cosine[torch.arange(N, device=cosine.device), targets] = target_logit
+
+        # Scale and compute CE loss
+        logits = cosine * self.scale
+        return self.ce_loss(logits, targets)
+
+
+class Stage2IpEmbeddingLoss(BaseLoss):
+    """Combined loss for Stage 2 IP embedding training.
+
+    L = L_multi_positive_infonce + lambda_sub * L_subcenter_arcface
+
+    The multi-positive InfoNCE component handles retrieval learning.
+    The Sub-center ArcFace component provides geometric class structure.
+
+    Requires ip_ids in kwargs (from Patch 2 metadata plumbing).
+
+    Environment variables:
+        SUBCENTER_NUM_CLASSES: Required. Number of IP classes.
+        SUBCENTER_K: Sub-centers per class (default: 5).
+        SUBCENTER_SCALE: ArcFace scale factor (default: 64).
+        SUBCENTER_MARGIN: ArcFace angular margin in radians (default: 0.2).
+        SUBCENTER_LAMBDA: Weight for sub-center loss (default: 0.1).
+        SUBCENTER_EMBED_DIM: Fallback embedding dimension if config inference fails.
+    """
+
+    def __init__(self, args: 'TrainingArguments', trainer: 'Trainer'):
+        super().__init__(args, trainer)
+
+        num_classes_str = os.environ.get('SUBCENTER_NUM_CLASSES')
+        if num_classes_str is None:
+            raise ValueError(
+                'SUBCENTER_NUM_CLASSES environment variable is required for stage2_ip_embedding. '
+                'Set it to the number of IP classes in your training data. '
+                'This value is in <output>.ip_id_map.json from the data construction script.')
+        num_classes = int(num_classes_str)
+
+        K = int(os.environ.get('SUBCENTER_K', '5'))
+        scale = float(os.environ.get('SUBCENTER_SCALE', '64'))
+        margin = float(os.environ.get('SUBCENTER_MARGIN', '0.2'))
+        self.lambda_sub = float(os.environ.get('SUBCENTER_LAMBDA', '0.1'))
+
+        # Infer embedding dimension
+        embed_dim = None
+        try:
+            from swift.utils import HfConfigFactory
+            embed_dim = HfConfigFactory.get_config_attr(trainer.model.config, 'hidden_size')
+        except Exception:
+            pass
+        if embed_dim is None:
+            embed_dim_str = os.environ.get('SUBCENTER_EMBED_DIM')
+            if embed_dim_str is not None:
+                embed_dim = int(embed_dim_str)
+        if embed_dim is None:
+            raise ValueError(
+                'Cannot infer embedding dimension from model config. '
+                'Set SUBCENTER_EMBED_DIM environment variable.')
+
+        self.mp_loss = MultiPositiveInfonceLoss(args, trainer)
+        self.head = SubcenterArcFaceHead(num_classes, embed_dim, K, scale, margin)
+
+        # Register head on model so its parameters are picked up by
+        # optimizer (created later), DDP gradient sync, and checkpoint saving.
+        trainer.model.ip_subcenter_head = self.head
+
+    def __call__(self, outputs, labels, **kwargs) -> torch.Tensor:
+        # Multi-positive InfoNCE component
+        mp_loss = self.mp_loss(outputs, labels, **kwargs)
+
+        # Sub-center ArcFace component
+        ip_ids = kwargs.get('ip_ids')
+        if ip_ids is None:
+            raise ValueError(
+                'stage2_ip_embedding requires ip_ids in training data. '
+                'Use --include_ip_id when building data, or set ip_id in JSONL rows.')
+
+        sentences = outputs['last_hidden_state']
+        groups = _parse_multi_positive_sentences(sentences, labels)
+
+        if len(ip_ids) != len(groups):
+            raise ValueError(
+                f'ip_ids length ({len(ip_ids)}) != number of groups ({len(groups)}). '
+                f'Each anchor row must have exactly one ip_id.')
+
+        # Collect embeddings with known class labels (anchor + positives only)
+        class_embeddings = []
+        class_targets = []
+        for i, (anchor, positives, _negatives) in enumerate(groups):
+            ip_id = ip_ids[i].item()
+            if ip_id == -1:
+                continue  # old-format row without ip_id
+            if ip_id < 0 or ip_id >= self.head.num_classes:
+                raise ValueError(
+                    f'ip_id={ip_id} out of range [0, {self.head.num_classes}). '
+                    f'Check SUBCENTER_NUM_CLASSES matches your ip_id_map.json.')
+            # anchor and all positives belong to this ip_id
+            group_embs = torch.cat([anchor.unsqueeze(0), positives], dim=0)  # [1+P, D]
+            class_embeddings.append(group_embs)
+            class_targets.extend([ip_id] * group_embs.size(0))
+
+        if len(class_embeddings) == 0:
+            # All groups have ip_id == -1; sub-center loss is undefined
+            return mp_loss
+
+        class_embeddings = torch.cat(class_embeddings, dim=0)  # [M, D]
+        class_targets = torch.tensor(class_targets, dtype=torch.long, device=class_embeddings.device)
+
+        sub_loss = self.head(class_embeddings, class_targets)
+
+        return mp_loss + self.lambda_sub * sub_loss

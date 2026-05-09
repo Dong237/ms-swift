@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .acc import AccMetrics
-from .embedding import InfonceMetrics, PairedMetrics
+from .embedding import InfonceMetrics, MultiPositiveInfonceMetrics, PairedMetrics
 from .nlg import NlgMetrics
 from .reranker import RerankerMetrics
 
@@ -12,6 +12,7 @@ eval_metrics_map = {
     'nlg': NlgMetrics,
     # embedding
     'infonce': InfonceMetrics,
+    'multi_positive_infonce': MultiPositiveInfonceMetrics,
     'paired': PairedMetrics,
     # reranker
     'reranker': RerankerMetrics,

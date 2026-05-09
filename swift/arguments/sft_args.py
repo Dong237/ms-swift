@@ -404,7 +404,10 @@ class SftArguments(SwanlabArguments, TunerArguments, BaseArguments, Seq2SeqTrain
             if self.task_type == 'causal_lm' and self.predict_with_generate:
                 self.eval_metric = 'nlg'
             elif self.task_type == 'embedding':
-                self.eval_metric = 'infonce' if self.loss_type == 'infonce' else 'paired'
+                if self.loss_type in ('infonce', 'multi_positive_infonce', 'stage2_ip_embedding'):
+                    self.eval_metric = 'multi_positive_infonce' if self.loss_type != 'infonce' else 'infonce'
+                else:
+                    self.eval_metric = 'paired'
             elif self.task_type in {'reranker', 'generative_reranker'}:
                 self.eval_metric = 'reranker'
         if self.eval_metric == 'nlg':

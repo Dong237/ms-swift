@@ -111,6 +111,71 @@ ms-swift 内置支持多种 HuggingFace 数据集：
 
 系统提示会自动与查询合并为嵌入输入。
 
+### 2.5 多模态嵌入数据（图像+文本）
+
+Qwen3.5 本身是多模态模型（`Qwen3_5ForConditionalGeneration`），`qwen3_5_emb` 模板继承了完整的图像处理能力，因此 **图文混合嵌入训练无需任何额外代码修改**，只需在数据中按规则添加图像字段即可。
+
+**格式规则**：
+1. 在 `messages`/`positive_messages`/`negative_messages` 的 `content` 中用 `<image>` 标签标记图像位置
+2. 通过对应的 `images`/`positive_images`/`negative_images` 字段提供图像来源（支持多种格式，见下方说明）
+3. 对齐规则：
+   - `images` 列表长度 = `messages` 中 `<image>` 标签的数量
+   - `positive_images` 和 `negative_images` 是 **列表的列表**（list-of-list），外层长度 = 对应 messages 的组数，内层长度 = 该组中 `<image>` 标签数量
+4. 当前约束：`positive_messages` 外层长度必须为 1（即只提供一个正例组）
+
+**示例一：图像查询 → 文本文档**（以图搜文）：
+```jsonl
+{"messages": [{"role": "user", "content": "<image>"}], "images": ["/data/images/product_photo.jpg"], "positive_messages": [[{"role": "user", "content": "这是一款红色运动鞋，采用透气网面设计，适合跑步和日常穿着。"}]]}
+```
+
+**示例二：文本查询 → 图文文档**（搜索带图的文档）：
+```jsonl
+{"messages": [{"role": "user", "content": "红色运动鞋推荐"}], "positive_messages": [[{"role": "user", "content": "<image>这款运动鞋采用最新缓震技术"}]], "positive_images": [["/data/images/shoe_detail.jpg"]]}
+```
+
+**示例三：图文混合 + 硬负例**（完整格式）：
+```jsonl
+{"messages": [{"role": "user", "content": "<image>这张图片中的建筑是什么风格？"}], "images": ["/data/images/building.jpg"], "positive_messages": [[{"role": "user", "content": "<image>哥特式建筑的典型特征包括尖拱、飞扶壁和彩色玻璃窗。"}]], "positive_images": [["/data/images/gothic_example.jpg"]], "negative_messages": [[{"role": "user", "content": "<image>现代主义建筑强调功能性和简洁线条。"}], [{"role": "user", "content": "巴洛克建筑以华丽的装饰和对称布局著称。"}]], "negative_images": [["/data/images/modern_building.jpg"], []]}
+```
+
+> **注意**：负例中如果没有图像，对应的 `negative_images` 内层列表为空 `[]`。
+
+**图像来源格式**：
+
+`images`/`positive_images`/`negative_images` 中的每个元素支持以下格式（框架通过 `swift/template/vision_utils.py` 中的 `load_file` 函数统一处理）：
+
+| 格式 | 示例 | 说明 |
+|------|------|------|
+| 本地文件路径 | `"/data/images/photo.jpg"` | 绝对路径或相对路径，支持 `~` 展开 |
+| HTTP/HTTPS URL | `"https://example.com/img.jpg"` | 自动下载，超时默认 20 秒（可通过 `SWIFT_TIMEOUT` 环境变量调整） |
+| Base64 字符串 | `"iVBORw0KGgoAAAANSUhEUg..."` | 纯 base64 编码的图像数据（无前缀） |
+| Data URI | `"data:image/jpeg;base64,/9j/4AAQ..."` | 带 MIME 类型前缀的 base64，常见于 Web 场景 |
+
+> **提示**：可通过环境变量 `ROOT_IMAGE_DIR` 设置图像根目录，框架会自动将相对路径拼接为完整路径。例如设置 `ROOT_IMAGE_DIR=/data/images` 后，数据中只需写 `"photo.jpg"` 而非完整路径。
+
+**使用 Base64 的示例**：
+```jsonl
+{"messages": [{"role": "user", "content": "<image>描述这张图片"}], "images": ["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="], "positive_messages": [[{"role": "user", "content": "一个白色像素点的最小PNG图像"}]]}
+```
+
+**使用 Data URI 的示例**：
+```jsonl
+{"messages": [{"role": "user", "content": "<image>这是什么产品？"}], "images": ["data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ..."], "positive_messages": [[{"role": "user", "content": "一款黑色无线蓝牙耳机，支持主动降噪功能。"}]]}
+```
+
+**使用 URL 的示例**：
+```jsonl
+{"messages": [{"role": "user", "content": "<image>"}], "images": ["https://example.com/images/product.jpg"], "positive_messages": [[{"role": "user", "content": "产品描述文本"}]]}
+```
+
+**字段对齐速查表**：
+
+| 字段 | 类型 | 对齐规则 |
+|------|------|----------|
+| `images` | `list[str]` | 长度 = `messages` 中 `<image>` 数量 |
+| `positive_images` | `list[list[str]]` | 外层长度 = `positive_messages` 组数（当前必须为1），内层长度 = 该组 `<image>` 数量 |
+| `negative_images` | `list[list[str]]` | 外层长度 = `negative_messages` 组数，内层长度 = 该组 `<image>` 数量 |
+
 ---
 
 ## 3. 训练
@@ -486,10 +551,7 @@ for i, emb in enumerate(response.data):
 
 ### Q4: 能否在 Qwen3.5-0.8B 上同时训练文本和图像嵌入？
 
-**理论上可以**，但需要额外工作：
-- 当前模板设计仅处理文本输入
-- 如需多模态嵌入，需要参考 `qwen3_vl_emb` 的模板设计
-- 建议先在纯文本上验证效果
+**可以，且已原生支持。** Qwen3.5 本身是多模态模型（`Qwen3_5ForConditionalGeneration`），`qwen3_5_emb` 模板继承了完整的图像处理能力，无需额外修改。只需在训练数据中按 **2.5 节** 的格式添加 `<image>` 标签和对应的图像路径字段即可进行图文混合嵌入训练。
 
 ---
 

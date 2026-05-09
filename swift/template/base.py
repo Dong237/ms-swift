@@ -154,6 +154,7 @@ class Template(ProcessorMixin):
         self.task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'prm', 'reranker',
                                 'generative_reranker'] = 'causal_lm'
         self.use_megatron = False
+        self.multi_positive_embedding = False
         self._handles = []
         self._deepspeed_initialize = None
 
@@ -416,12 +417,31 @@ class Template(ProcessorMixin):
             for key in anchor_encoded:
                 _encoded[f'anchor_{key}'] = anchor_encoded[key]
             positive = inputs.positive
-            if isinstance(positive, list):
-                positive = positive[0]
-            positive_encoded = self._encode_truncated(positive)
-            for key in positive_encoded:
-                _encoded[f'positive_{key}'] = positive_encoded[key]
-            labels.append(float(inputs.chosen.label) if inputs.chosen.label is not None else 1.0)
+            if not isinstance(positive, list):
+                positive = [positive]
+            if not self.multi_positive_embedding:
+                # Single-positive path (backward compatible)
+                positive_encoded = self._encode_truncated(positive[0])
+                for key in positive_encoded:
+                    _encoded[f'positive_{key}'] = positive_encoded[key]
+                labels.append(float(inputs.chosen.label) if inputs.chosen.label is not None else 1.0)
+            else:
+                # Multi-positive path: encode all positives as lists (mirrors negative encoding)
+                _all_positive_keys = set()
+                for idx, pos in enumerate(positive):
+                    _tmp_positive_keys = set()
+                    pos_encoded = self._encode_truncated(pos)
+                    for key in pos_encoded:
+                        positive_key = f'positive_{key}'
+                        _all_positive_keys.add(positive_key)
+                        _tmp_positive_keys.add(positive_key)
+                        if positive_key not in _encoded:
+                            _encoded[positive_key] = [None] * idx
+                        _encoded[positive_key].append(pos_encoded[key])
+                    for miss_key in (_all_positive_keys - _tmp_positive_keys):
+                        _encoded[miss_key].append(None)
+                    # 2.0 = group boundary (first positive), 1.0 = additional positive
+                    labels.append(2.0 if idx == 0 else 1.0)
 
             _all_negative_keys = set()
             for idx, negative in enumerate(inputs.negative):
@@ -439,6 +459,9 @@ class Template(ProcessorMixin):
                 labels.append(0.0)
 
             _encoded['labels'] = labels
+            ip_id = inputs.chosen.extra_kwargs.get('ip_id')
+            if ip_id is not None:
+                _encoded['ip_id'] = int(ip_id)
         else:
             anchor = inputs.chosen
             _encoded = self._encode_truncated(anchor)
@@ -1619,8 +1642,17 @@ class Template(ProcessorMixin):
                                  *,
                                  padding_to: Optional[int] = None) -> Dict[str, Any]:
         labels = []
+        ip_ids = []
+        has_ip_id = False
         new_batch = []
         for b in batch:
+            ip_id = b.pop('ip_id', None)
+            if ip_id is not None:
+                has_ip_id = True
+                ip_ids.append(int(ip_id))
+            else:
+                # -1 means this outer sample has no class id; Patch 3 losses must ignore it.
+                ip_ids.append(-1)
             if 'input_ids' in b:
                 new_batch += [b]
             else:
@@ -1634,7 +1666,27 @@ class Template(ProcessorMixin):
                         b[f'negative{i}_{suffix}'] = value
                     b.pop(key)
 
-                indexes = ['anchor_', 'positive_']
+                # Expand multi-positive lists (same pattern as negatives)
+                # Only when multi_positive_embedding is active; otherwise positive_* values
+                # are flat token lists (list[int]) that must NOT be expanded.
+                max_pos = None
+                if self.multi_positive_embedding:
+                    pos_keys = [key for key in b.keys()
+                                if key.startswith('positive_') and isinstance(b[key], list)]
+                    for key in pos_keys:
+                        value_list = b[key]
+                        suffix = key[len('positive_'):]
+                        max_pos = len(value_list)
+                        for i, value in enumerate(value_list):
+                            b[f'positive{i}_{suffix}'] = value
+                        b.pop(key)
+
+                indexes = ['anchor_']
+                if max_pos is not None:
+                    for i in range(max_pos):
+                        indexes.append(f'positive{i}_')
+                else:
+                    indexes.append('positive_')
                 if max_neg is not None:
                     for i in range(0, max_neg):
                         indexes.append(f'negative{i}_')
@@ -1646,6 +1698,8 @@ class Template(ProcessorMixin):
         res['num_samples'] = num_samples
         if labels:
             res['labels'] = torch.tensor(labels, dtype=torch.float32)
+        if has_ip_id:
+            res['ip_ids'] = torch.tensor(ip_ids, dtype=torch.long)
         return res
 
     def _reranker_data_collator(self,

@@ -107,6 +107,9 @@ class SwiftMixin:
         self.model_info = model.model_info
 
         data_collator = self._get_data_collator(args, template)
+        # Set self.model early so loss functions that need to register submodules
+        # (e.g. Stage2IpEmbeddingLoss proxy head) can access it before super().__init__.
+        self.model = model
         kwargs.update(self.create_loss_and_eval_metric(args))
         trainer_parameters = inspect.signature(HfTrainer.__init__).parameters
         tokenizer_key = 'processing_class' if 'processing_class' in trainer_parameters else 'tokenizer'

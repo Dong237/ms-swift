@@ -66,6 +66,8 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         args = self.args
         template = args.get_template(self.processor)
         template.set_mode('train')
+        if args.loss_type in ('multi_positive_infonce', 'stage2_ip_embedding'):
+            template.multi_positive_embedding = True
         if template.use_model:
             template.model = self.model
         support_padding_free = template.support_padding_free
