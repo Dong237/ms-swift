@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
 # Stage 2: Multi-positive InfoNCE (WITHOUT Sub-center ArcFace)
-# Qwen3.5-9B — 8 nodes × 8 H20 GPUs (64 GPUs)
+# Qwen3.5-9B — 6 nodes × 8 H20 GPUs (48 GPUs)
 #
 # Uses multi_positive_infonce loss with 3 positives per sample.
 # No ip_id required. No Sub-center ArcFace.
@@ -30,7 +30,7 @@ pip install qwen_vl_utils decord deepspeed -U
 
 # ── Multi-node distributed setup ──
 export NPROC_PER_NODE=8
-export NNODES=${ARNOLD_WORKER_NUM:-${WORLD_SIZE:-${NNODES:-8}}}
+export NNODES=${ARNOLD_WORKER_NUM:-${WORLD_SIZE:-${NNODES:-6}}}
 export NODE_RANK=${ARNOLD_ID:-${RANK:-${NODE_RANK:-0}}}
 export MASTER_ADDR=${ARNOLD_WORKER_0_HOST:-${MASTER_ADDR:-}}
 export MASTER_PORT=${ARNOLD_WORKER_0_PORT:-${MASTER_PORT:-29500}}
@@ -72,10 +72,10 @@ LEARNING_RATE=2e-6
 NUM_EPOCHS=3
 MAX_LENGTH=1536
 
-# Steps/epoch = 198,786 * 0.98 / 128 ≈ 1,522 (multipos p3 data, 2% val split)
+# Steps/epoch = 198,786 * 0.98 / 96 ≈ 2,029 (multipos p3 data, 2% val split, 48 GPUs × batch 2)
 # Eval twice per epoch, save every epoch
-EVAL_STEPS=761
-SAVE_STEPS=1522
+EVAL_STEPS=1015
+SAVE_STEPS=2029
 
 swift sft \
     --model "${STAGE1_CHECKPOINT}" \
