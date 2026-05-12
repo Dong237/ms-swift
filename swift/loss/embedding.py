@@ -574,5 +574,15 @@ class Stage2IpEmbeddingLoss(BaseLoss):
         class_targets = torch.tensor(class_targets, dtype=torch.long, device=class_embeddings.device)
 
         sub_loss = self.head(class_embeddings, class_targets)
+        weighted_sub_loss = self.lambda_sub * sub_loss
+        total_loss = mp_loss + weighted_sub_loss
 
-        return mp_loss + self.lambda_sub * sub_loss
+        metrics = getattr(self.trainer, 'custom_metrics', None)
+        if metrics is not None:
+            mode = 'train' if self.trainer.model.training else 'eval'
+            metrics[mode]['stage2_mp_loss'].update(mp_loss.detach())
+            metrics[mode]['stage2_subcenter_loss'].update(sub_loss.detach())
+            metrics[mode]['stage2_weighted_subcenter_loss'].update(weighted_sub_loss.detach())
+            metrics[mode]['stage2_total_loss'].update(total_loss.detach())
+
+        return total_loss

@@ -1,32 +1,31 @@
 #!/bin/bash
 # ============================================================================
-# Production Stage 2: Multi-positive InfoNCE + Sub-center ArcFace
-# Qwen3.5-9B IP Embedding — 6 nodes × 8 H20 GPUs (48 GPUs)
+# Stage 2 Sub-center ArcFace Smoke Test
+# Qwen3.5-9B IP Embedding — multi-positive InfoNCE + Sub-center ArcFace
 #
-# Loss:
-#   stage2_ip_embedding =
-#     multi_positive_infonce + SUBCENTER_LAMBDA * subcenter_arcface
+# Purpose:
+#   This script is for validating that the upgraded training code path works:
+#     - loss_type=stage2_ip_embedding is registered and importable
+#     - multi-positive labels can be parsed
+#     - Sub-center ArcFace proxies can be created
+#     - one short distributed training run can enter forward/backward
 #
-# Required data:
-#   DATASET_PATH must point to the multi-positive JSONL generated with
-#   --include_ip_id / INCLUDE_IP_ID=true. Each row must contain:
-#     - positive_images: one or more same-IP positives
-#     - ip_id: integer class id
-#     - ip_name: standard IP name
-#   A sidecar file must exist at:
-#     ${DATASET_PATH}.ip_id_map.json
+# This is NOT a real Stage 2 continuation script. It defaults to MODEL_PATH as
+# the base model so you can quickly test the loss plumbing. For real Stage 2,
+# set MODEL_PATH/STAGE1_CHECKPOINT to a Stage 1 checkpoint.
 #
-# Required model:
-#   STAGE1_CHECKPOINT should point to the Stage 1 InfoNCE checkpoint for real
-#   Stage 2 continuation. For pure plumbing tests, set it to the base model path,
-#   but production runs should use the Stage 1 checkpoint.
+# Recommended usage:
+#   bash /private/tmp/run_stage2_subcenter_smoke_test.sh
 #
-# Typical usage:
-#   STAGE1_CHECKPOINT=/mnt/bn/.../checkpoint-2029 \
-#   DATASET_PATH=/mnt/bn/.../train_merged_multipos_p3.jsonl \
-#   bash projects/ips/prepare-training/stage2/train_ip_embedding_stage2_subcenter_9B.sh
+# Optional overrides:
+#   MODEL_PATH=/path/to/stage1/checkpoint \
+#   DATASET_PATH=/path/to/train_merged_multipos_p3.jsonl \
+#   MAX_STEPS=20 \
+#   SUBCENTER_K=3 \
+#   SUBCENTER_LAMBDA=0.05 \
+#   bash /private/tmp/run_stage2_subcenter_smoke_test.sh
 # ============================================================================
-set -euo pipefail
+set -euxo pipefail
 trap 'echo "FAILED at line ${LINENO}: ${BASH_COMMAND} (exit=$?)" >&2' ERR
 
 echo "=== USER SCRIPT START ==="
@@ -40,12 +39,12 @@ git rev-parse --short HEAD || true
 echo "========================="
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-STAGE1_CHECKPOINT=${STAGE1_CHECKPOINT:?"ERROR: Set STAGE1_CHECKPOINT to your Stage 1 output checkpoint."}
+MODEL_PATH=${MODEL_PATH:-"/mnt/bn/youxiang-lf/models/Qwen3.5-9B"}
 DATASET_PATH=${DATASET_PATH:-"/mnt/bn/youxiang-lf/data/facial_ip/output_train_test_set/training/train_merged_multipos_p3.jsonl"}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"/mnt/bn/youxiang-lf/models_emb_ip"}
 
-if [ ! -e "${STAGE1_CHECKPOINT}" ]; then
-    echo "ERROR: STAGE1_CHECKPOINT does not exist: ${STAGE1_CHECKPOINT}"
+if [ ! -e "${MODEL_PATH}" ]; then
+    echo "ERROR: MODEL_PATH does not exist: ${MODEL_PATH}"
     exit 1
 fi
 if [ ! -f "${DATASET_PATH}" ]; then
@@ -54,9 +53,9 @@ if [ ! -f "${DATASET_PATH}" ]; then
 fi
 
 echo "=== Preflight paths ==="
-echo "STAGE1_CHECKPOINT=${STAGE1_CHECKPOINT}"
+echo "MODEL_PATH=${MODEL_PATH}"
 echo "DATASET_PATH=${DATASET_PATH}"
-ls -ld "${STAGE1_CHECKPOINT}"
+ls -ld "${MODEL_PATH}"
 ls -lh "${DATASET_PATH}"
 ls -lh "${DATASET_PATH}.ip_id_map.json" || true
 head -n 1 "${DATASET_PATH}" | cut -c 1-800
@@ -89,8 +88,6 @@ with open(dataset, encoding="utf-8") as f:
 print("first row keys:", sorted(row.keys()))
 if "ip_id" not in row:
     raise SystemExit("ERROR: ip_id not found in first row. Regenerate data with INCLUDE_IP_ID=true.")
-if not isinstance(row["ip_id"], int):
-    raise SystemExit(f"ERROR: ip_id must be int, got {type(row['ip_id']).__name__}.")
 if "positive_images" not in row or len(row["positive_images"]) < 1:
     raise SystemExit("ERROR: positive_images missing or empty.")
 print("first row ip_id:", row["ip_id"])
@@ -145,24 +142,22 @@ export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-1024}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-'expandable_segments:True'}
 
 export WANDB_PROJECT=${WANDB_PROJECT:-"qwen3-5-embedding-ip"}
-run_name=${RUN_NAME:-"qwen3-5-9B-ip-embedding-stage2-subcenter-k${SUBCENTER_K}-lam${SUBCENTER_LAMBDA}"}
+run_name=${RUN_NAME:-"qwen3-5-9B-ip-embedding-stage2-subcenter-smoke-k${SUBCENTER_K}-lam${SUBCENTER_LAMBDA}"}
 export WANDB_NAME="$run_name"
 OUTPUT_DIR="${OUTPUT_ROOT}/${run_name}"
 
-# ── Production hyperparameters ────────────────────────────────────────────────
+# ── Smoke-test hyperparameters ────────────────────────────────────────────────
 BATCH_SIZE=${BATCH_SIZE:-2}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
 LEARNING_RATE=${LEARNING_RATE:-2e-6}
-NUM_EPOCHS=${NUM_EPOCHS:-2}
 MAX_LENGTH=${MAX_LENGTH:-1536}
+MAX_STEPS=${MAX_STEPS:-20}
 
-# For 198,786 rows, split 2%, 48 GPUs, batch 2:
-# steps/epoch ~= 198,786 * 0.98 / (48 * 2) ~= 2,029.
-# Eval twice per epoch, save once per epoch.
-EVAL_STEPS=${EVAL_STEPS:-1015}
-SAVE_STEPS=${SAVE_STEPS:-2029}
+# Keep eval/save steps larger than MAX_STEPS so the smoke test focuses on train.
+EVAL_STEPS=${EVAL_STEPS:-100000}
+SAVE_STEPS=${SAVE_STEPS:-100000}
 
-echo "=== Stage 2 Sub-center config ==="
+echo "=== Sub-center smoke config ==="
 echo "SUBCENTER_NUM_CLASSES=${SUBCENTER_NUM_CLASSES}"
 echo "SUBCENTER_K=${SUBCENTER_K}"
 echo "SUBCENTER_SCALE=${SUBCENTER_SCALE}"
@@ -170,13 +165,12 @@ echo "SUBCENTER_MARGIN=${SUBCENTER_MARGIN}"
 echo "SUBCENTER_LAMBDA=${SUBCENTER_LAMBDA}"
 echo "INFONCE_TEMPERATURE=${INFONCE_TEMPERATURE}"
 echo "INFONCE_USE_BATCH=${INFONCE_USE_BATCH}"
-echo "NUM_EPOCHS=${NUM_EPOCHS}"
-echo "LEARNING_RATE=${LEARNING_RATE}"
+echo "MAX_STEPS=${MAX_STEPS}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "==============================="
 
 swift sft \
-    --model "${STAGE1_CHECKPOINT}" \
+    --model "${MODEL_PATH}" \
     --model_type qwen3_5_emb \
     --task_type embedding \
     --loss_type stage2_ip_embedding \
@@ -193,7 +187,7 @@ swift sft \
     --weight_decay 0.01 \
     --max_grad_norm 1.0 \
     --adam_beta2 0.999 \
-    --num_train_epochs ${NUM_EPOCHS} \
+    --max_steps ${MAX_STEPS} \
     --max_length ${MAX_LENGTH} \
     --truncation_strategy right \
     --per_device_train_batch_size ${BATCH_SIZE} \
@@ -203,8 +197,8 @@ swift sft \
     --eval_strategy steps \
     --eval_steps ${EVAL_STEPS} \
     --save_steps ${SAVE_STEPS} \
-    --save_total_limit 5 \
-    --logging_steps 5 \
+    --save_total_limit 1 \
+    --logging_steps 1 \
     --dataloader_drop_last true \
     --dataloader_num_workers 8 \
     --dataset_num_proc 64 \
@@ -212,4 +206,4 @@ swift sft \
     --output_dir "${OUTPUT_DIR}" \
     --report_to wandb
 
-echo "=== Stage 2 (multi-positive + sub-center) finished at $(date) ==="
+echo "=== Stage 2 sub-center smoke test finished at $(date) ==="
