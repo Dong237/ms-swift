@@ -142,6 +142,42 @@ L_stage2_ip = L_multi_positive_infonce + lambda_sub * L_subcenter_arcface
 
 其中 multi-positive InfoNCE 仍然是主 loss，Sub-center ArcFace 是辅助几何约束。
 
+默认实现保持未归一化组合：
+
+```text
+stage2_loss_norm = none
+L_total = L_mp + lambda_sub * L_subcenter
+```
+
+为了做 loss 尺度 ablation，新增静态参考归一化开关：
+
+```text
+stage2_loss_norm = subcenter_ref
+L_total = L_mp + lambda_sub * (L_subcenter / log(num_classes))
+```
+
+这里使用 `log(num_classes)`，因为 Sub-center ArcFace 最终是 `num_classes` 分类交叉熵；在接近随机分类时，CE 的参考尺度约为 `log(num_classes)`。这个归一化不会动态平衡梯度，也不会改变 multi-positive InfoNCE，只是把 class-count-dependent 的辅助 CE 项压到更可比较的尺度，方便判断 `lambda_sub` 是否过强。
+
+Ablation 时建议固定数据、checkpoint、学习率、`SUBCENTER_LAMBDA`、`SUBCENTER_K`，只比较：
+
+```text
+--stage2_loss_norm none
+--stage2_loss_norm subcenter_ref
+```
+
+重点看 W&B 中的：
+
+```text
+train/stage2_mp_loss
+train/stage2_subcenter_loss              # raw CE
+train/stage2_subcenter_loss_effective    # 进入 total loss 的 CE 项
+train/stage2_weighted_subcenter_loss
+train/stage2_total_loss
+train/grad_norm
+```
+
+如果 `subcenter_ref` 下 `stage2_weighted_subcenter_loss` 明显更稳定、`grad_norm` 尖峰减少，同时检索评估不下降，说明原始 subcenter 项对训练过强；如果检索指标变差，说明当前 `lambda_sub` 在未归一化尺度下可能刚好合适，或者需要重新调大归一化后的 `SUBCENTER_LAMBDA`。
+
 Sub-center ArcFace 的 proxy 形状为：
 
 ```text
@@ -177,6 +213,7 @@ SUBCENTER_K = 3
 SUBCENTER_LAMBDA = 0.05
 SUBCENTER_MARGIN = 0.2
 SUBCENTER_SCALE = 64
+STAGE2_LOSS_NORM = none
 ```
 
 如果某些 IP 实际只有单一形态，max-over-K 会让一个 dominant sub-center 获得主要梯度，其余子中心较少被激活，通常不会显著破坏训练。但 `K` 过大仍然会增加不必要自由度，所以不建议第一版使用 `K=10`。

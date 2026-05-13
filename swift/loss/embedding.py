@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import math
 import numpy as np
 import os
 import torch
@@ -476,7 +477,11 @@ class SubcenterArcFaceHead(nn.Module):
 class Stage2IpEmbeddingLoss(BaseLoss):
     """Combined loss for Stage 2 IP embedding training.
 
-    L = L_multi_positive_infonce + lambda_sub * L_subcenter_arcface
+    Default:
+        L = L_multi_positive_infonce + lambda_sub * L_subcenter_arcface
+
+    With --stage2_loss_norm subcenter_ref:
+        L = L_multi_positive_infonce + lambda_sub * (L_subcenter_arcface / log(num_classes))
 
     The multi-positive InfoNCE component handles retrieval learning.
     The Sub-center ArcFace component provides geometric class structure.
@@ -490,6 +495,7 @@ class Stage2IpEmbeddingLoss(BaseLoss):
         SUBCENTER_MARGIN: ArcFace angular margin in radians (default: 0.2).
         SUBCENTER_LAMBDA: Weight for sub-center loss (default: 0.1).
         SUBCENTER_EMBED_DIM: Fallback embedding dimension if config inference fails.
+        stage2_loss_norm: Training arg, one of {"none", "subcenter_ref"}.
     """
 
     def __init__(self, args: 'TrainingArguments', trainer: 'Trainer'):
@@ -507,6 +513,22 @@ class Stage2IpEmbeddingLoss(BaseLoss):
         scale = float(os.environ.get('SUBCENTER_SCALE', '64'))
         margin = float(os.environ.get('SUBCENTER_MARGIN', '0.2'))
         self.lambda_sub = float(os.environ.get('SUBCENTER_LAMBDA', '0.1'))
+        self.stage2_loss_norm = getattr(args, 'stage2_loss_norm', 'none')
+        if self.stage2_loss_norm is None:
+            self.stage2_loss_norm = 'none'
+        valid_loss_norms = {'none', 'subcenter_ref'}
+        if self.stage2_loss_norm not in valid_loss_norms:
+            raise ValueError(
+                f'Unsupported stage2_loss_norm={self.stage2_loss_norm!r}. '
+                f'Expected one of {sorted(valid_loss_norms)}.')
+
+        self.subcenter_norm_factor = 1.0
+        if self.stage2_loss_norm == 'subcenter_ref':
+            if num_classes < 2:
+                raise ValueError(
+                    'stage2_loss_norm="subcenter_ref" requires SUBCENTER_NUM_CLASSES >= 2, '
+                    f'got {num_classes}.')
+            self.subcenter_norm_factor = math.log(num_classes)
 
         # Infer embedding dimension
         embed_dim = None
@@ -574,7 +596,10 @@ class Stage2IpEmbeddingLoss(BaseLoss):
         class_targets = torch.tensor(class_targets, dtype=torch.long, device=class_embeddings.device)
 
         sub_loss = self.head(class_embeddings, class_targets)
-        weighted_sub_loss = self.lambda_sub * sub_loss
+        effective_sub_loss = sub_loss
+        if self.stage2_loss_norm == 'subcenter_ref':
+            effective_sub_loss = sub_loss / self.subcenter_norm_factor
+        weighted_sub_loss = self.lambda_sub * effective_sub_loss
         total_loss = mp_loss + weighted_sub_loss
 
         metrics = getattr(self.trainer, 'custom_metrics', None)
@@ -582,6 +607,8 @@ class Stage2IpEmbeddingLoss(BaseLoss):
             mode = 'train' if self.trainer.model.training else 'eval'
             metrics[mode]['stage2_mp_loss'].update(mp_loss.detach())
             metrics[mode]['stage2_subcenter_loss'].update(sub_loss.detach())
+            metrics[mode]['stage2_subcenter_loss_effective'].update(effective_sub_loss.detach())
+            metrics[mode]['stage2_subcenter_norm_factor'].update(self.subcenter_norm_factor)
             metrics[mode]['stage2_weighted_subcenter_loss'].update(weighted_sub_loss.detach())
             metrics[mode]['stage2_total_loss'].update(total_loss.detach())
 

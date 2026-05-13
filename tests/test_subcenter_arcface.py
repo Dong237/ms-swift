@@ -1,8 +1,10 @@
 """Unit tests for SubcenterArcFaceHead and Stage2IpEmbeddingLoss.
 
 Tests cover: head shape/gradient, target-only margin, loss composition,
-ip_id=-1 skipping, missing ip_ids error, and proxy parameter registration.
+stage2 loss normalization, ip_id=-1 skipping, missing ip_ids error,
+and proxy parameter registration.
 """
+import math
 import os
 import unittest
 
@@ -85,7 +87,7 @@ class TestSubcenterArcFaceHead(unittest.TestCase):
 
 class TestStage2IpEmbeddingLoss(unittest.TestCase):
 
-    def _make_loss(self, num_classes=10, embed_dim=16, K=2, lambda_sub=0.1):
+    def _make_loss(self, num_classes=10, embed_dim=16, K=2, lambda_sub=0.1, stage2_loss_norm=None):
         """Create a Stage2IpEmbeddingLoss using the real __init__ path."""
         os.environ['SUBCENTER_NUM_CLASSES'] = str(num_classes)
         os.environ['SUBCENTER_K'] = str(K)
@@ -106,7 +108,11 @@ class TestStage2IpEmbeddingLoss(unittest.TestCase):
         trainer = MockTrainer()
         trainer.model = model
 
-        loss_fn = Stage2IpEmbeddingLoss(args=None, trainer=trainer)
+        args = None
+        if stage2_loss_norm is not None:
+            args = type('Args', (), {'stage2_loss_norm': stage2_loss_norm})()
+
+        loss_fn = Stage2IpEmbeddingLoss(args=args, trainer=trainer)
 
         return loss_fn, model
 
@@ -114,6 +120,38 @@ class TestStage2IpEmbeddingLoss(unittest.TestCase):
         for key in ['SUBCENTER_NUM_CLASSES', 'SUBCENTER_K', 'SUBCENTER_SCALE',
                      'SUBCENTER_MARGIN', 'SUBCENTER_LAMBDA', 'SUBCENTER_EMBED_DIM']:
             os.environ.pop(key, None)
+
+    def _stage2_expected_terms(self, loss_fn, sentences, labels, ip_ids):
+        """Return mp_loss and raw subcenter loss for the same data path."""
+        from swift.loss.embedding import _parse_multi_positive_sentences
+
+        mp_loss = loss_fn.mp_loss({'last_hidden_state': sentences}, labels)
+        groups = _parse_multi_positive_sentences(sentences, labels)
+
+        class_embeddings = []
+        class_targets = []
+        for i, (anchor, positives, _negatives) in enumerate(groups):
+            ip_id = ip_ids[i].item()
+            if ip_id == -1:
+                continue
+            group_embs = torch.cat([anchor.unsqueeze(0), positives], dim=0)
+            class_embeddings.append(group_embs)
+            class_targets.extend([ip_id] * group_embs.size(0))
+
+        class_embeddings = torch.cat(class_embeddings, dim=0)
+        class_targets = torch.tensor(class_targets, dtype=torch.long, device=class_embeddings.device)
+        sub_loss = loss_fn.head(class_embeddings, class_targets)
+        return mp_loss, sub_loss
+
+    def _single_group_inputs(self, embed_dim=16, ip_id=1):
+        torch.manual_seed(42)
+        anchor = F.normalize(torch.randn(1, embed_dim), dim=1)
+        pos = F.normalize(torch.randn(1, embed_dim), dim=1)
+        neg = F.normalize(torch.randn(2, embed_dim), dim=1)
+        sentences = torch.cat([anchor, pos, neg], dim=0)
+        labels = torch.tensor([2.0, 0.0, 0.0])
+        ip_ids = torch.tensor([ip_id])
+        return sentences, labels, ip_ids
 
     def test_composition(self):
         """Combined loss = mp_loss + lambda * sub_loss, finite and positive."""
@@ -205,6 +243,69 @@ class TestStage2IpEmbeddingLoss(unittest.TestCase):
 
         self.assertAlmostEqual(combined_loss.item(), mp_loss.item(), places=5,
                                msg='lambda=0 should make stage2 loss equal to mp_loss')
+        self._cleanup_env()
+
+    def test_default_loss_norm_uses_raw_subcenter_loss(self):
+        """Default/no arg keeps current mp_loss + lambda * raw subcenter behavior."""
+        lambda_sub = 0.2
+        loss_fn, _ = self._make_loss(num_classes=5, embed_dim=16, lambda_sub=lambda_sub)
+        sentences, labels, ip_ids = self._single_group_inputs(embed_dim=16, ip_id=1)
+
+        total_loss = loss_fn({'last_hidden_state': sentences}, labels, ip_ids=ip_ids)
+        mp_loss, sub_loss = self._stage2_expected_terms(loss_fn, sentences, labels, ip_ids)
+        expected = mp_loss + lambda_sub * sub_loss
+
+        self.assertAlmostEqual(total_loss.item(), expected.item(), places=5)
+        self.assertEqual(loss_fn.stage2_loss_norm, 'none')
+        self.assertEqual(loss_fn.subcenter_norm_factor, 1.0)
+        self._cleanup_env()
+
+    def test_explicit_none_loss_norm_uses_raw_subcenter_loss(self):
+        """stage2_loss_norm='none' is exactly the unnormalized formula."""
+        lambda_sub = 0.2
+        loss_fn, _ = self._make_loss(
+            num_classes=5, embed_dim=16, lambda_sub=lambda_sub, stage2_loss_norm='none')
+        sentences, labels, ip_ids = self._single_group_inputs(embed_dim=16, ip_id=1)
+
+        total_loss = loss_fn({'last_hidden_state': sentences}, labels, ip_ids=ip_ids)
+        mp_loss, sub_loss = self._stage2_expected_terms(loss_fn, sentences, labels, ip_ids)
+        expected = mp_loss + lambda_sub * sub_loss
+
+        self.assertAlmostEqual(total_loss.item(), expected.item(), places=5)
+        self.assertEqual(loss_fn.stage2_loss_norm, 'none')
+        self.assertEqual(loss_fn.subcenter_norm_factor, 1.0)
+        self._cleanup_env()
+
+    def test_subcenter_ref_loss_norm_divides_by_log_num_classes(self):
+        """subcenter_ref uses mp_loss + lambda * raw_subcenter / log(num_classes)."""
+        num_classes = 7
+        lambda_sub = 0.2
+        loss_fn, _ = self._make_loss(
+            num_classes=num_classes,
+            embed_dim=16,
+            lambda_sub=lambda_sub,
+            stage2_loss_norm='subcenter_ref')
+        sentences, labels, ip_ids = self._single_group_inputs(embed_dim=16, ip_id=1)
+
+        total_loss = loss_fn({'last_hidden_state': sentences}, labels, ip_ids=ip_ids)
+        mp_loss, sub_loss = self._stage2_expected_terms(loss_fn, sentences, labels, ip_ids)
+        expected = mp_loss + lambda_sub * (sub_loss / math.log(num_classes))
+
+        self.assertAlmostEqual(total_loss.item(), expected.item(), places=5)
+        self.assertEqual(loss_fn.stage2_loss_norm, 'subcenter_ref')
+        self.assertAlmostEqual(loss_fn.subcenter_norm_factor, math.log(num_classes), places=7)
+        self._cleanup_env()
+
+    def test_invalid_stage2_loss_norm_raises(self):
+        """Unknown stage2_loss_norm values fail early at loss construction."""
+        with self.assertRaises(ValueError):
+            self._make_loss(num_classes=5, embed_dim=16, stage2_loss_norm='bad_mode')
+        self._cleanup_env()
+
+    def test_subcenter_ref_requires_at_least_two_classes(self):
+        """log(num_classes) reference normalization is invalid for one class."""
+        with self.assertRaises(ValueError):
+            self._make_loss(num_classes=1, embed_dim=16, stage2_loss_norm='subcenter_ref')
         self._cleanup_env()
 
 

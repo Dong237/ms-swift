@@ -76,6 +76,9 @@ class TrainArgumentsMixin:
             Available optimizers can be found in `optimizers/mapping.py`
         loss_type (Optional[str]): Custom loss_type name. Default is None, uses the model's built-in loss function.
             Available loss options can be found in `loss/mapping.py`
+        stage2_loss_norm (Literal['none', 'subcenter_ref']): Loss normalization mode for `stage2_ip_embedding`.
+            `none` keeps the raw combined loss. `subcenter_ref` divides the Sub-center ArcFace term by
+            `log(num_classes)` before applying `SUBCENTER_LAMBDA`. Defaults to `none`.
         metric (Optional[str]): Custom eval metric name. Default is None. Available eval_metric options can be found
             in `eval_metric/mapping.py`.
         callbacks (List[str]): Custom trainer callbacks, default is `[]`. Available callbacks can be found
@@ -163,6 +166,7 @@ class TrainArgumentsMixin:
     # plugins
     optimizer: Optional[str] = None
     loss_type: Optional[str] = field(default=None, metadata={'help': f'loss_func choices: {list(loss_map.keys())}'})
+    stage2_loss_norm: Literal['none', 'subcenter_ref'] = 'none'
     eval_metric: Optional[str] = None
     callbacks: List[str] = field(default_factory=list)
     # early_step

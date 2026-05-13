@@ -101,6 +101,25 @@ infonce loss支持几个环境变量：
 > 也可以在数据集中将hard negatives数量设置为数量相等，这样即使不设置也不会使用for循环方式，加快计算速度
 > `negative_messages`也可以不提供。在这种情况下，保持`INFONCE_USE_BATCH=True`，会使用一个batch内部的其他样本作为负例
 
+### 高级：`stage2_ip_embedding`
+
+`stage2_ip_embedding` 是面向 IP embedding 训练的组合 loss：
+
+```text
+L = L_multi_positive_infonce + lambda_sub * L_subcenter_arcface
+```
+
+Sub-center ArcFace 相关配置通过环境变量控制：`SUBCENTER_NUM_CLASSES`、`SUBCENTER_K`、`SUBCENTER_SCALE`、`SUBCENTER_MARGIN`、`SUBCENTER_LAMBDA`。其中 `SUBCENTER_NUM_CLASSES` 必须和数据构建脚本输出的 `ip_id_map.json` 一致，JSONL 每行需要包含 `ip_id`。
+
+可通过训练参数开启静态参考归一化 ablation：
+
+```bash
+--stage2_loss_norm none          # 默认，保持原始组合 loss
+--stage2_loss_norm subcenter_ref # 使用 L_subcenter / log(num_classes)
+```
+
+`subcenter_ref` 只归一化 Sub-center ArcFace 辅助项，不改变 `multi_positive_infonce`。
+
 infonce loss的评测会有下面几个指标：
 - mean_neg 所有hard_negative的平均值
 - mean_pos 所有positive的平均值

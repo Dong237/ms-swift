@@ -513,6 +513,7 @@ query image
 - checkpoint 保存和恢复。
 - DDP 下 proxy 参数同步。
 - lambda / margin / scale 的配置入口。
+- `stage2_loss_norm` 默认必须为 `none`，保证旧脚本和普通 `infonce`/`multi_positive_infonce` 向后兼容。
 
 建议新增 loss type：
 
@@ -525,6 +526,15 @@ stage2_ip_embedding
 ```text
 L = L_multi_positive_infonce + lambda_sub * L_subcenter_arcface
 ```
+
+静态参考归一化 ablation：
+
+```text
+--stage2_loss_norm none          # 默认，保持当前行为
+--stage2_loss_norm subcenter_ref # L_subcenter / log(num_classes)
+```
+
+`subcenter_ref` 只归一化 Sub-center ArcFace 辅助项，不改变 `multi_positive_infonce`。它用于判断 `SUBCENTER_LAMBDA` 是否因为 class-level CE 尺度过大而压过 retrieval loss。
 
 ### Patch 4: Hard Mining 数据闭环
 

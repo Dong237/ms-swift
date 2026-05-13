@@ -102,6 +102,25 @@ InfoNCE loss supports the following environment variables:
 >
 > `negative_messages` can be omitted. In this case, keep `INFONCE_USE_BATCH=True` to use in-batch negatives (other samples in the batch) as negatives.
 
+### Advanced: `stage2_ip_embedding`
+
+`stage2_ip_embedding` is a combined loss for IP embedding training:
+
+```text
+L = L_multi_positive_infonce + lambda_sub * L_subcenter_arcface
+```
+
+Sub-center ArcFace is configured through environment variables: `SUBCENTER_NUM_CLASSES`, `SUBCENTER_K`, `SUBCENTER_SCALE`, `SUBCENTER_MARGIN`, and `SUBCENTER_LAMBDA`. `SUBCENTER_NUM_CLASSES` must match the `ip_id_map.json` produced by the data builder, and each JSONL row must contain `ip_id`.
+
+Static reference normalization can be enabled for ablation:
+
+```bash
+--stage2_loss_norm none          # default, preserve the raw combined loss
+--stage2_loss_norm subcenter_ref # use L_subcenter / log(num_classes)
+```
+
+`subcenter_ref` only normalizes the Sub-center ArcFace auxiliary term. It does not change `multi_positive_infonce`.
+
 The evaluation of InfoNCE loss includes the following metrics:
 - mean_neg: The average of all hard negatives
 - mean_pos: The average of all positives

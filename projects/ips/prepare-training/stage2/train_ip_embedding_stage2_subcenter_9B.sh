@@ -6,6 +6,9 @@
 # Loss:
 #   stage2_ip_embedding =
 #     multi_positive_infonce + SUBCENTER_LAMBDA * subcenter_arcface
+#   Optional ablation:
+#     STAGE2_LOSS_NORM=subcenter_ref divides subcenter_arcface by log(num_classes)
+#     before applying SUBCENTER_LAMBDA. Default is STAGE2_LOSS_NORM=none.
 #
 # Required data:
 #   DATASET_PATH must point to the multi-positive JSONL generated with
@@ -139,13 +142,14 @@ export SUBCENTER_K=${SUBCENTER_K:-3}
 export SUBCENTER_SCALE=${SUBCENTER_SCALE:-64}
 export SUBCENTER_MARGIN=${SUBCENTER_MARGIN:-0.2}
 export SUBCENTER_LAMBDA=${SUBCENTER_LAMBDA:-0.05}
+STAGE2_LOSS_NORM=${STAGE2_LOSS_NORM:-none}
 
 # ── Runtime config ────────────────────────────────────────────────────────────
 export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-1024}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-'expandable_segments:True'}
 
 export WANDB_PROJECT=${WANDB_PROJECT:-"qwen3-5-embedding-ip"}
-run_name=${RUN_NAME:-"qwen3-5-9B-ip-embedding-stage2-subcenter-k${SUBCENTER_K}-lam${SUBCENTER_LAMBDA}"}
+run_name=${RUN_NAME:-"qwen3-5-9B-ip-embedding-stage2-subcenter-k${SUBCENTER_K}-lam${SUBCENTER_LAMBDA}-norm${STAGE2_LOSS_NORM}"}
 export WANDB_NAME="$run_name"
 OUTPUT_DIR="${OUTPUT_ROOT}/${run_name}"
 
@@ -168,6 +172,7 @@ echo "SUBCENTER_K=${SUBCENTER_K}"
 echo "SUBCENTER_SCALE=${SUBCENTER_SCALE}"
 echo "SUBCENTER_MARGIN=${SUBCENTER_MARGIN}"
 echo "SUBCENTER_LAMBDA=${SUBCENTER_LAMBDA}"
+echo "STAGE2_LOSS_NORM=${STAGE2_LOSS_NORM}"
 echo "INFONCE_TEMPERATURE=${INFONCE_TEMPERATURE}"
 echo "INFONCE_USE_BATCH=${INFONCE_USE_BATCH}"
 echo "NUM_EPOCHS=${NUM_EPOCHS}"
@@ -180,6 +185,7 @@ swift sft \
     --model_type qwen3_5_emb \
     --task_type embedding \
     --loss_type stage2_ip_embedding \
+    --stage2_loss_norm "${STAGE2_LOSS_NORM}" \
     --system "提取该IP角色的身份特征，关注角色本身而非背景或姿态" \
     --tuner_type full \
     --torch_dtype bfloat16 \
